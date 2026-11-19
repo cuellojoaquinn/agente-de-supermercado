@@ -3,8 +3,8 @@ from langchain.agents.middleware import ModelRequest, dynamic_prompt
 import preferencias
 from model import get_model
 from langchain_google_genai.chat_models import GoogleAPIError, GoogleRateLimitError
-from tools import (EstadoAgente, buscar_productos, descartar_productos, elegir_supermercados,
-                   guardar_preferencia, optimizar_compra, quitar_preferencia)
+from tools import (Contexto, EstadoAgente, buscar_productos, descartar_productos, elegir_supermercados,
+                   guardar_preferencia, optimizar_carrito, optimizar_compra, quitar_preferencia)
 import sqlite3
 from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -18,6 +18,8 @@ SYSTEM_PROMPT = """Sos un asistente que ayuda a ahorrar en compras de supermerca
 - Buscá primero con las palabras del usuario (búsqueda general). Al final de la respuesta,
   ofrecele afinar: algo más específico (tipo, marca, tamaño, según las variantes encontradas)
   o quedarse con lo más barato.
+- Si pide optimizar o revisar su carrito, usá optimizar_carrito. Si una compra reparte
+  en varios supermercados por poco ahorro, decíselo y proponé ir a menos.
 - Cuando exprese gustos o restricciones (marcas, marcas propias, otras condiciones),
   guardalos con guardar_preferencia y respetalos.
 - Respondé en español, con montos en pesos."""
@@ -45,11 +47,12 @@ def crear_agente(proveedor: str | None = None):
     return create_agent(
         model=get_model(proveedor),
         tools=[elegir_supermercados, buscar_productos, descartar_productos, optimizar_compra,
-               guardar_preferencia, quitar_preferencia],
+               optimizar_carrito, guardar_preferencia, quitar_preferencia],
         middleware=[prompt_con_preferencias],  # system prompt + preferencias vigentes
         checkpointer=checkpointer,
         state_schema=EstadoAgente,  # guarda supermercados y preferencias junto a los mensajes
         store=preferencias.store,   # memoria de largo plazo (memoria.db)
+        context_schema=Contexto,    # la UI pasa el carrito en cada mensaje
     )
 
 
