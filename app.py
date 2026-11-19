@@ -238,8 +238,7 @@ def quitar_preferencia_ui(pref: dict):
     if pref["alcance"] == "siempre":
         preferencias.borrar(pref["clave"])
     else:
-        actuales = agente.get_state(config).values.get("preferencias") or []
-        agente.update_state(config, {"preferencias": [p for p in actuales if p["clave"] != pref["clave"]]})
+        agente.update_state(config, {"preferencias": {pref["clave"]: None}})  # el reducer la quita
 
 
 def dibujar_preferencias():

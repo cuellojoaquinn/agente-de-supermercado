@@ -62,7 +62,10 @@ def borrar(clave: str, store_=None):
 def efectivas(estado: dict | None, store_=None) -> list[dict]:
     """Las de largo plazo + las de esta conversación, sin repetidas."""
     todas = {p["clave"]: {**p, "alcance": "siempre"} for p in guardadas(store_)}
-    for p in (estado or {}).get("preferencias") or []:
+    de_la_conversacion = (estado or {}).get("preferencias") or {}
+    if isinstance(de_la_conversacion, dict):   # {clave: pref}; conversaciones viejas: lista
+        de_la_conversacion = list(de_la_conversacion.values())
+    for p in de_la_conversacion:
         todas.setdefault(p["clave"], {**p, "alcance": "conversacion"})
     return list(todas.values())
 

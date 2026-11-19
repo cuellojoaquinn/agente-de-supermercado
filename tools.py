@@ -3,7 +3,7 @@ import re
 import unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from typing import NotRequired
+from typing import Annotated, NotRequired
 from langchain.agents import AgentState
 from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
@@ -19,14 +19,42 @@ MAX_POR_SUPER = 5           # tope de lo que devolvemos por súper (cuidado del 
 ETIQUETA_UNIDAD = {"ml": "$/L", "g": "$/kg", "un": "$/un", "m": "$/m", "m2": "$/m2"}
 
 
+# Reducers: el modelo puede llamar varias tools en paralelo en el mismo paso (ej: un
+# descartar_productos por cada búsqueda). Sin reducer, LangGraph no sabe qué valor quedarse
+# y corta con InvalidUpdateError. Con reducer, cada tool manda solo su cambio y se combinan.
+
+def _ultimo(actual, nuevo):
+    return nuevo
+
+
+def _fusionar_preferencias(actual, nuevo) -> dict:
+    """{clave: preferencia}; una clave con None la quita. Acepta el formato viejo (lista)."""
+    como_dict = lambda x: {p["clave"]: p for p in x} if isinstance(x, list) else dict(x or {})
+    resultado = como_dict(actual)
+    for clave, pref in como_dict(nuevo).items() if isinstance(nuevo, list) else (nuevo or {}).items():
+        if pref is None:
+            resultado.pop(clave, None)
+        else:
+            resultado[clave] = pref
+    return resultado
+
+
+def _fusionar_descartados(actual, nuevo) -> dict:
+    """{búsqueda: [claves de producto]}: se suman, sin repetidos."""
+    resultado = {k: list(v) for k, v in (actual or {}).items()}
+    for busqueda, claves in (nuevo or {}).items():
+        resultado[busqueda] = list(dict.fromkeys(resultado.get(busqueda, []) + list(claves)))
+    return resultado
+
+
 class EstadoAgente(AgentState):
     """Estado de la conversación (se guarda en checkpoints.db con los mensajes).
     supermercados: los que eligió el usuario con elegir_supermercados; ausente = todos.
-    preferencias: las de esta conversación (las de largo plazo están en el Store).
+    preferencias: las de esta conversación, {clave: preferencia} (las de largo plazo están en el Store).
     descartados: por búsqueda, los productos que el modelo marcó como que no corresponden."""
-    supermercados: NotRequired[list[str] | None]
-    preferencias: NotRequired[list[dict]]
-    descartados: NotRequired[dict[str, list[str]]]
+    supermercados: NotRequired[Annotated[list[str] | None, _ultimo]]
+    preferencias: NotRequired[Annotated[dict[str, dict], _fusionar_preferencias]]
+    descartados: NotRequired[Annotated[dict[str, list[str]], _fusionar_descartados]]
 
 
 def _validar(supermercados: list[str]) -> tuple[list[str], list[str]]:
@@ -126,14 +154,13 @@ def guardar_preferencia(tipo: TipoPreferencia, valor: str | None = None,
     if alcance == "siempre":
         prefs_.guardar(pref, getattr(runtime, "store", None))
         texto = f"Guardada para siempre: {prefs_.etiqueta(pref)}."
-        actuales = (runtime.state or {}).get("preferencias") or []
-        update = {"preferencias": [p for p in actuales if p["clave"] != pref["clave"]]}
+        cambio = {pref["clave"]: None}   # si estaba en la conversación, pasa a largo plazo
     else:
-        actuales = (runtime.state or {}).get("preferencias") or []
-        update = {"preferencias": [p for p in actuales if p["clave"] != pref["clave"]] + [pref]}
         texto = (f"Guardada para esta conversación: {prefs_.etiqueta(pref)}. Si no lo pidió "
                  f"explícitamente para siempre, preguntale si quiere que la recuerdes.")
-    return Command(update={**update, "messages": [ToolMessage(texto, tool_call_id=runtime.tool_call_id)]})
+        cambio = {pref["clave"]: pref}
+    return Command(update={"preferencias": cambio,
+                           "messages": [ToolMessage(texto, tool_call_id=runtime.tool_call_id)]})
 
 
 @tool(parse_docstring=True)
@@ -148,9 +175,8 @@ def quitar_preferencia(tipo: TipoPreferencia, valor: str | None = None,
     """
     clave = prefs_.nueva(tipo, valor)["clave"]
     prefs_.borrar(clave, getattr(runtime, "store", None))
-    actuales = (runtime.state or {}).get("preferencias") or []
     texto = f"Preferencia quitada: {prefs_.etiqueta(prefs_.nueva(tipo, valor))}."
-    return Command(update={"preferencias": [p for p in actuales if p["clave"] != clave],
+    return Command(update={"preferencias": {clave: None},
                            "messages": [ToolMessage(texto, tool_call_id=runtime.tool_call_id)]})
 
 
@@ -176,13 +202,11 @@ def descartar_productos(busqueda: str, productos: list[ProductoDescartado], moti
         productos: los que no corresponden, con su supermercado y sku_id.
         motivo: por qué no corresponden, en pocas palabras.
     """
-    descartados = dict((runtime.state or {}).get("descartados") or {})
-    clave_busqueda = prefs_._normalizar(busqueda)
     nuevos = [clave_producto(p.supermercado, p.sku_id) for p in
               (x if isinstance(x, ProductoDescartado) else ProductoDescartado(**x) for x in productos)]
-    descartados[clave_busqueda] = list(dict.fromkeys(descartados.get(clave_busqueda, []) + nuevos))
     texto = f"Ocultados {len(nuevos)} resultados de '{busqueda}' ({motivo})."
-    return Command(update={"descartados": descartados,
+    # solo lo nuevo: el reducer lo suma a lo que ya había (aunque haya otras llamadas en paralelo)
+    return Command(update={"descartados": {prefs_._normalizar(busqueda): nuevos},
                            "messages": [ToolMessage(texto, tool_call_id=runtime.tool_call_id)]})
 
 
