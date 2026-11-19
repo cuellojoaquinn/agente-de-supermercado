@@ -1,7 +1,7 @@
 from langchain.agents import create_agent
 from model import get_model
 from langchain_google_genai.chat_models import GoogleAPIError, GoogleRateLimitError
-from tools import buscar_productos, optimizar_compra
+from tools import EstadoAgente, buscar_productos, elegir_supermercados, optimizar_compra
 import sqlite3
 from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -9,6 +9,8 @@ SYSTEM_PROMPT = """Sos un asistente que ayuda a ahorrar en compras de supermerca
 - Nunca inventes precios: obtenelos siempre con las herramientas.
 - Compará por precio unitario ($/L, $/kg), no por precio de góndola.
 - Descartá resultados cuya categoría no corresponda a lo que pidió el usuario.
+- Si el usuario no dijo en qué supermercados buscar y todavía no los eligió en esta
+  conversación, preguntale con elegir_supermercados antes de buscar.
 - Respondé en español, con montos en pesos."""
 
 # Nos pide poder mostrar una memoria corto plazo. Corto plazo: solamente consultar mensajes de esta conversacion.
@@ -22,9 +24,10 @@ checkpointer.setup()  # crea las tablas si la base es nueva
 def crear_agente(proveedor: str | None = None):
     return create_agent(
         model=get_model(proveedor),
-        tools=[buscar_productos, optimizar_compra],
+        tools=[elegir_supermercados, buscar_productos, optimizar_compra],
         system_prompt=SYSTEM_PROMPT,
         checkpointer=checkpointer,
+        state_schema=EstadoAgente,  # guarda los supermercados elegidos junto a los mensajes
     )
 
 
