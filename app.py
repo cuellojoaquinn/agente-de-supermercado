@@ -19,6 +19,8 @@ import streamlit as st
 
 from agente import crear_agente, listar_conversaciones, mensaje_error
 from model import modelos_disponibles, proveedor_default
+from supermercados import SUPERMERCADOS
+from langgraph.types import Command
 
 st.set_page_config(page_title="Super-agente", page_icon="🛒")
 
@@ -33,10 +35,12 @@ def get_agente():
 def nueva_conversacion():
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.historial = []
+    st.session_state.en_curso = None  # turno pausado esperando que el usuario elija supermercados
 
 
 if "thread_id" not in st.session_state:
     nueva_conversacion()
+st.session_state.setdefault("en_curso", None)  # sesiones abiertas antes de este cambio
 
 MODELO_ACTUAL = modelos_disponibles()[proveedor_default()]  # el del .env (PROVEEDOR)
 
@@ -138,25 +142,33 @@ def pasos_de_mensaje(nodo: str, msg) -> tuple[list[dict], str | None]:
     return pasos, respuesta
 
 
-def ejecutar(pregunta: str) -> dict:
-    turno = {"pasos": [], "respuesta": None, "error": None}
+def ejecutar(entrada, turno: dict | None = None) -> dict:
+    """Corre el agente en streaming. entrada: la pregunta, o Command(resume=...) para seguir un
+    turno pausado. Si el agente se pausa (elegir_supermercados), devuelve el turno con esperando=True."""
+    turno = turno or {"pasos": [], "respuesta": None, "error": None}
+    turno["esperando"] = False
     with st.status("Pensando...", expanded=True) as estado:
         try:
-            for chunk in agente.stream({"messages": [{"role": "user", "content": pregunta}]},
-                                       config, stream_mode="updates"):
+            for chunk in agente.stream(entrada, config, stream_mode="updates"):
                 for nodo, data in chunk.items():
-                    for msg in (data or {}).get("messages", []):
-                        pasos, respuesta = pasos_de_mensaje(nodo, msg)
-                        for paso in pasos:
-                            dibujar_paso(paso)  # se ve apenas termina cada paso
-                            if paso["tipo"] == "tool_call":
-                                estado.update(label=f"Usando {paso['nombre']}...")
-                        turno["pasos"].extend(pasos)
-                        if respuesta:
-                            turno["respuesta"] = respuesta
+                    if nodo == "__interrupt__":  # una tool pidió la intervención del usuario
+                        turno["esperando"] = True
+                        continue
+                    # una tool que devuelve Command llega como lista de actualizaciones
+                    for update in data if isinstance(data, list) else [data]:
+                        for msg in (update or {}).get("messages", []):
+                            pasos, respuesta = pasos_de_mensaje(nodo, msg)
+                            for paso in pasos:
+                                dibujar_paso(paso)  # se ve apenas termina cada paso
+                                if paso["tipo"] == "tool_call":
+                                    estado.update(label=f"Usando {paso['nombre']}...")
+                            turno["pasos"].extend(pasos)
+                            if respuesta:
+                                turno["respuesta"] = respuesta
             n_tools = sum(p["tipo"] == "tool_call" for p in turno["pasos"])
-            estado.update(label=f"Listo · {n_tools} llamadas a herramientas",
-                          state="complete", expanded=False)
+            etiqueta = ("Esperando que elijas los supermercados" if turno["esperando"]
+                        else f"Listo · {n_tools} llamadas a herramientas")
+            estado.update(label=etiqueta, state="complete", expanded=False)
         except Exception as e:
             mensaje = mensaje_error(e)
             if mensaje is None:
@@ -169,6 +181,16 @@ def ejecutar(pregunta: str) -> dict:
     if turno["respuesta"]:
         st.markdown(turno["respuesta"])
     return turno
+
+
+def terminar_turno(turno: dict):
+    """Guarda el turno en el historial, o lo deja en curso si el agente espera al usuario."""
+    if turno["esperando"]:
+        st.session_state.en_curso = turno
+    else:
+        st.session_state.historial.append({"rol": "assistant", **turno})
+        st.session_state.en_curso = None
+    st.rerun()  # redibuja: la tarjeta si espera, y la barra lateral con la conversación
 
 
 # ------------------------------------------------------------------ retomar conversaciones
@@ -228,6 +250,11 @@ def grupo_de_fecha(fecha: date) -> str:
 def retomar(thread_id: str):
     st.session_state.thread_id = thread_id
     st.session_state.historial = historial_desde_estado(thread_id)
+    st.session_state.en_curso = None
+    # si la conversación quedó pausada esperando la elección, se vuelve a mostrar la tarjeta
+    pausada = agente.get_state({"configurable": {"thread_id": thread_id}}).interrupts
+    if pausada and st.session_state.historial and st.session_state.historial[-1]["rol"] == "assistant":
+        st.session_state.en_curso = {**st.session_state.historial.pop(), "esperando": True}
 
 
 def dibujar_historial_conversaciones():
@@ -277,11 +304,59 @@ with st.bottom:
     st.markdown(f"<div style='text-align:right;font-size:0.8rem;opacity:0.6'>{MODELO_ACTUAL}</div>",
                 unsafe_allow_html=True)
 
-if pregunta := st.chat_input("Ej: tengo que comprar 2 L de leche y 1 kg de yerba, ¿dónde me conviene?"):
+# ------------------------------------------------------------------ elección de supermercados
+
+# casillas: arrancan todas marcadas y después recuerdan la última elección. Se guarda aparte
+# porque Streamlit borra el estado de las casillas cuando la tarjeta deja de mostrarse.
+st.session_state.setdefault("ultima_eleccion", list(SUPERMERCADOS))
+
+
+def _marcar_todos():
+    for k in SUPERMERCADOS:
+        st.session_state[f"super_{k}"] = st.session_state.super_todos
+
+
+def _actualizar_todos():
+    st.session_state.super_todos = all(st.session_state[f"super_{k}"] for k in SUPERMERCADOS)
+
+
+def elegir_supermercados() -> list[str] | None:
+    """Tarjeta con casillas. Devuelve las claves elegidas al tocar 'Buscar', si no None."""
+    for k in SUPERMERCADOS:
+        st.session_state.setdefault(f"super_{k}", k in st.session_state.ultima_eleccion)
+    st.session_state.setdefault("super_todos", all(st.session_state[f"super_{k}"] for k in SUPERMERCADOS))
+    with st.container(border=True):
+        st.markdown("**¿En qué supermercados busco?**")
+        st.checkbox("Todos", key="super_todos", on_change=_marcar_todos)
+        columnas = st.columns(3)
+        for i, (clave, adapter) in enumerate(SUPERMERCADOS.items()):
+            columnas[i % 3].checkbox(adapter.nombre, key=f"super_{clave}", on_change=_actualizar_todos)
+        elegidos = [k for k in SUPERMERCADOS if st.session_state[f"super_{k}"]]
+        if not elegidos:
+            st.caption("Elegí al menos un supermercado.")
+        if st.button("Buscar", type="primary", disabled=not elegidos):
+            st.session_state.ultima_eleccion = elegidos
+            return elegidos
+    return None
+
+
+# ------------------------------------------------------------------ chat
+
+# el agente pausado por elegir_supermercados: lo hecho hasta ahora + la tarjeta para elegir
+if turno_en_curso := st.session_state.en_curso:
+    with st.chat_message("assistant"):
+        dibujar_turno_asistente(turno_en_curso)
+        tarjeta = st.empty()
+        with tarjeta.container():
+            elegidos = elegir_supermercados()
+        if elegidos:
+            tarjeta.empty()  # se reemplaza la tarjeta por la continuación en vivo
+            terminar_turno(ejecutar(Command(resume=elegidos), turno_en_curso))
+
+if pregunta := st.chat_input("Ej: tengo que comprar 2 L de leche y 1 kg de yerba, ¿dónde me conviene?",
+                             disabled=bool(st.session_state.en_curso)):
     st.session_state.historial.append({"rol": "user", "texto": pregunta})
     with st.chat_message("user"):
         st.markdown(pregunta)
     with st.chat_message("assistant"):
-        turno = ejecutar(pregunta)
-    st.session_state.historial.append({"rol": "assistant", **turno})
-    st.rerun()  # la barra lateral ya se dibujó: recargar para que la conversación aparezca en el selector
+        terminar_turno(ejecutar({"messages": [{"role": "user", "content": pregunta}]}))

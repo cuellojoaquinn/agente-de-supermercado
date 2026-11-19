@@ -2,7 +2,11 @@ import math
 import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from langchain.tools import tool
+from typing import NotRequired
+from langchain.agents import AgentState
+from langchain.messages import ToolMessage
+from langchain.tools import ToolRuntime, tool
+from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 from cache import guardar_busqueda, obtener_busqueda
 from supermercados import SUPERMERCADOS
@@ -11,6 +15,54 @@ RESULTADOS_POR_SUPER = 20   # cuántos traemos de cada API para después ordenar
 MAX_POR_SUPER = 5           # tope de lo que devolvemos por súper (cuidado del contexto)
 ETIQUETA_UNIDAD = {"ml": "$/L", "g": "$/kg", "un": "$/un", "m": "$/m", "m2": "$/m2"}
 
+
+class EstadoAgente(AgentState):
+    """Estado de la conversación (se guarda en checkpoints.db con los mensajes).
+    supermercados: los que eligió el usuario con elegir_supermercados; ausente = todos."""
+    supermercados: NotRequired[list[str] | None]
+
+
+def _validar(supermercados: list[str]) -> tuple[list[str], list[str]]:
+    """(claves normalizadas sin repetidos, desconocidas)."""
+    claves = list(dict.fromkeys(s.strip().lower() for s in supermercados))
+    return claves, [s for s in claves if s not in SUPERMERCADOS]
+
+
+def _por_defecto(runtime) -> list[str]:
+    """Si el modelo no indica supermercados: los que eligió el usuario en esta conversación, o todos."""
+    estado = getattr(runtime, "state", None) or {}
+    return estado.get("supermercados") or list(SUPERMERCADOS)
+
+
+def _nombres(claves) -> str:
+    return ", ".join(SUPERMERCADOS[s].nombre for s in claves)
+
+
+# ---------------------------------------------------------------- elegir_supermercados
+
+@tool
+def elegir_supermercados(runtime: ToolRuntime) -> Command:
+    """Le pregunta al usuario en qué supermercados buscar, con una ventana para elegir.
+
+    Usala UNA vez, sola y antes de buscar_productos, cuando el usuario pide comparar
+    precios y no dijo en qué supermercados. No la uses si ya los nombró ("en Vea y Día"),
+    si ya los eligió antes en esta conversación (respetá esa elección en las búsquedas
+    siguientes) o si pide explícitamente cambiarlos (en ese caso sí, volvé a preguntar).
+    """
+    # pausa el agente: la UI muestra la ventana y lo reanuda con la lista elegida
+    elegidos = interrupt({"tipo": "elegir_supermercados"})
+    claves, desconocidos = _validar(elegidos or [])
+    claves = [c for c in claves if c not in desconocidos] or list(SUPERMERCADOS)
+    texto = ("El usuario eligió buscar en todos los supermercados." if len(claves) == len(SUPERMERCADOS)
+             else f"El usuario eligió buscar solo en: {_nombres(claves)}. Usá esa elección en las búsquedas "
+                  f"de esta conversación, salvo que pida explícitamente otro supermercado.")
+    return Command(update={
+        "supermercados": None if len(claves) == len(SUPERMERCADOS) else claves,
+        "messages": [ToolMessage(texto, tool_call_id=runtime.tool_call_id)],
+    })
+
+
+# ---------------------------------------------------------------- buscar_productos
 
 def _formatear(prod) -> dict:
     """Solo los campos que el modelo necesita, para no llenar el contexto.
@@ -37,13 +89,15 @@ def _buscar_en(adapter, producto: str):
 
 @tool(parse_docstring=True)
 def buscar_productos(producto: str, cantidad_por_super: int = 3,
-                     supermercados: list[str] | None = None) -> dict:
+                     supermercados: list[str] | None = None,
+                     runtime: ToolRuntime = None) -> dict:
     """Busca un producto en los supermercados disponibles (todos, o solo los indicados)
     y devuelve, para cada supermercado, las opciones más convenientes ordenadas por
     precio unitario ($/L, $/kg o $/un). Sirve para comparar precios entre supermercados.
 
     Si el usuario pide un supermercado puntual, pasalo en `supermercados` en vez de
-    buscar en todos y filtrar después.
+    buscar en todos y filtrar después. Si lo omitís, se usan los que el usuario eligió
+    con elegir_supermercados en esta conversación (o todos, si no eligió).
 
     Usá términos específicos que incluyan tipo y, si importa, presentación
     (ej: "leche entera 1 litro", "yerba mate 1 kg"). Una búsqueda genérica
@@ -55,16 +109,15 @@ def buscar_productos(producto: str, cantidad_por_super: int = 3,
         cantidad_por_super: cantidad de opciones a devolver por supermercado (1 a 5).
         supermercados: opcional, limita la búsqueda a estos supermercados. Valores
             válidos: "vea", "jumbo", "carrefour", "changomas", "dia". Si se omite,
-            busca en todos.
+            usa la elección del usuario o todos.
     """
     cantidad = max(1, min(cantidad_por_super, MAX_POR_SUPER))
 
-    claves = [s.strip().lower() for s in supermercados] if supermercados else list(SUPERMERCADOS)
-    desconocidos = [s for s in claves if s not in SUPERMERCADOS]
+    claves, desconocidos = _validar(supermercados or _por_defecto(runtime))
     if desconocidos:
         return {"error": f"Supermercado desconocido: {desconocidos}. "
                          f"Opciones válidas: {list(SUPERMERCADOS)}"}
-    elegidos = [SUPERMERCADOS[s] for s in dict.fromkeys(claves)]  # sin repetidos
+    elegidos = [SUPERMERCADOS[s] for s in claves]
 
     # Consultamos los supermercados elegidos en paralelo
     with ThreadPoolExecutor(max_workers=len(elegidos)) as pool:
@@ -177,7 +230,8 @@ def _mejor_opcion(productos, unidad_base: str, cantidad_base: float, busqueda: s
 
 
 @tool(parse_docstring=True)
-def optimizar_compra(items: list[ItemCompra]) -> dict:
+def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = None,
+                     runtime: ToolRuntime = None) -> dict:
     """Calcula la forma más barata de comprar una lista completa, usando los precios
     ya obtenidos con buscar_productos (no consulta de nuevo los supermercados).
     Compara comprar cada producto donde está más barato (compra mixta) contra
@@ -189,10 +243,18 @@ def optimizar_compra(items: list[ItemCompra]) -> dict:
 
     Args:
         items: productos a comprar, cada uno con busqueda, cantidad y unidad.
+        supermercados: opcional, supermercados a comparar (mismos valores que en
+            buscar_productos). Si se omite, usa la elección del usuario o todos.
     """
     sin_buscar, unidad_invalida = [], []
     mixta, por_super = [], {}   # por_super: súper -> {busqueda: opción}
     pedidos = []
+    # la cache puede tener súper de búsquedas anteriores: se comparan solo los que corresponden
+    claves, desconocidos = _validar(supermercados or _por_defecto(runtime))
+    if desconocidos:
+        return {"error": f"Supermercado desconocido: {desconocidos}. "
+                         f"Opciones válidas: {list(SUPERMERCADOS)}"}
+    nombres_permitidos = {SUPERMERCADOS[s].nombre for s in claves}
 
     for item in items:
         item = item if isinstance(item, ItemCompra) else ItemCompra(**item)
@@ -200,6 +262,7 @@ def optimizar_compra(items: list[ItemCompra]) -> dict:
         if productos is None:
             sin_buscar.append(item.busqueda)
             continue
+        productos = [p for p in productos if p.supermercado in nombres_permitidos]
         if item.unidad.lower() not in UNIDADES:
             unidad_invalida.append(f"{item.busqueda} ({item.unidad})")
             continue
