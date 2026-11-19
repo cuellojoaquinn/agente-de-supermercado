@@ -1,16 +1,25 @@
 from langchain.agents import create_agent
+from langchain.agents.middleware import ModelRequest, dynamic_prompt
+import preferencias
 from model import get_model
 from langchain_google_genai.chat_models import GoogleAPIError, GoogleRateLimitError
-from tools import EstadoAgente, buscar_productos, elegir_supermercados, optimizar_compra
+from tools import (EstadoAgente, buscar_productos, descartar_productos, elegir_supermercados,
+                   guardar_preferencia, optimizar_compra, quitar_preferencia)
 import sqlite3
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 SYSTEM_PROMPT = """Sos un asistente que ayuda a ahorrar en compras de supermercado en Argentina.
 - Nunca inventes precios: obtenelos siempre con las herramientas.
 - Compará por precio unitario ($/L, $/kg), no por precio de góndola.
-- Descartá resultados cuya categoría no corresponda a lo que pidió el usuario.
+- Descartá resultados cuya categoría no corresponda a lo que pidió el usuario, y registralos
+  siempre con descartar_productos (si no, se le siguen ofreciendo en la lista del carrito).
 - Si el usuario no dijo en qué supermercados buscar y todavía no los eligió en esta
   conversación, preguntale con elegir_supermercados antes de buscar.
+- Buscá primero con las palabras del usuario (búsqueda general). Al final de la respuesta,
+  ofrecele afinar: algo más específico (tipo, marca, tamaño, según las variantes encontradas)
+  o quedarse con lo más barato.
+- Cuando exprese gustos o restricciones (marcas, marcas propias, otras condiciones),
+  guardalos con guardar_preferencia y respetalos.
 - Respondé en español, con montos en pesos."""
 
 # Nos pide poder mostrar una memoria corto plazo. Corto plazo: solamente consultar mensajes de esta conversacion.
@@ -21,13 +30,26 @@ checkpointer = SqliteSaver(sqlite3.connect("checkpoints.db", check_same_thread=F
 checkpointer.setup()  # crea las tablas si la base es nueva
 
 
+@dynamic_prompt
+def prompt_con_preferencias(request: ModelRequest) -> str:
+    """Agrega al system prompt las preferencias vigentes (largo plazo + esta conversación)."""
+    prefs = preferencias.efectivas(request.state, request.runtime.store)
+    if not prefs:
+        return SYSTEM_PROMPT
+    lineas = [f"- {preferencias.etiqueta(p)} ({'siempre' if p['alcance'] == 'siempre' else 'esta conversación'})"
+              for p in prefs]
+    return SYSTEM_PROMPT + "\n\nPreferencias del usuario (respetalas):\n" + "\n".join(lineas)
+
+
 def crear_agente(proveedor: str | None = None):
     return create_agent(
         model=get_model(proveedor),
-        tools=[elegir_supermercados, buscar_productos, optimizar_compra],
-        system_prompt=SYSTEM_PROMPT,
+        tools=[elegir_supermercados, buscar_productos, descartar_productos, optimizar_compra,
+               guardar_preferencia, quitar_preferencia],
+        middleware=[prompt_con_preferencias],  # system prompt + preferencias vigentes
         checkpointer=checkpointer,
-        state_schema=EstadoAgente,  # guarda los supermercados elegidos junto a los mensajes
+        state_schema=EstadoAgente,  # guarda supermercados y preferencias junto a los mensajes
+        store=preferencias.store,   # memoria de largo plazo (memoria.db)
     )
 
 

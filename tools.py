@@ -1,6 +1,7 @@
 import math
 import re
 import unicodedata
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import NotRequired
 from langchain.agents import AgentState
@@ -8,7 +9,9 @@ from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
+import preferencias as prefs_
 from cache import guardar_busqueda, obtener_busqueda
+from preferencias import TipoPreferencia
 from supermercados import SUPERMERCADOS
 
 RESULTADOS_POR_SUPER = 20   # cuántos traemos de cada API para después ordenar nosotros
@@ -18,8 +21,12 @@ ETIQUETA_UNIDAD = {"ml": "$/L", "g": "$/kg", "un": "$/un", "m": "$/m", "m2": "$/
 
 class EstadoAgente(AgentState):
     """Estado de la conversación (se guarda en checkpoints.db con los mensajes).
-    supermercados: los que eligió el usuario con elegir_supermercados; ausente = todos."""
+    supermercados: los que eligió el usuario con elegir_supermercados; ausente = todos.
+    preferencias: las de esta conversación (las de largo plazo están en el Store).
+    descartados: por búsqueda, los productos que el modelo marcó como que no corresponden."""
     supermercados: NotRequired[list[str] | None]
+    preferencias: NotRequired[list[dict]]
+    descartados: NotRequired[dict[str, list[str]]]
 
 
 def _validar(supermercados: list[str]) -> tuple[list[str], list[str]]:
@@ -32,6 +39,34 @@ def _por_defecto(runtime) -> list[str]:
     """Si el modelo no indica supermercados: los que eligió el usuario en esta conversación, o todos."""
     estado = getattr(runtime, "state", None) or {}
     return estado.get("supermercados") or list(SUPERMERCADOS)
+
+
+def _preferencias(runtime) -> list[dict]:
+    """Las que valen ahora: largo plazo (Store) + esta conversación (estado)."""
+    return prefs_.efectivas(getattr(runtime, "state", None), getattr(runtime, "store", None))
+
+
+def _presentacion(prod) -> str | None:
+    """1000 ml -> '1 L', 500 g -> '500 g', 6 un -> '6 un'."""
+    if not prod.contenido or not prod.unidad:
+        return None
+    grande = {"ml": "L", "g": "kg"}.get(prod.unidad)
+    if grande and prod.contenido >= 1000:
+        return f"{prod.contenido / 1000:g} {grande}"
+    return f"{prod.contenido:g} {prod.unidad}"
+
+
+def _variantes(productos) -> dict:
+    """Resumen de lo encontrado para ofrecerle al usuario cómo afinar la búsqueda."""
+    marcas = Counter(p.marca for p in productos if p.marca)
+    presentaciones = Counter(filter(None, map(_presentacion, productos)))
+    return {"marcas": [m for m, _ in marcas.most_common(8)],
+            "presentaciones": [x for x, _ in presentaciones.most_common(6)]}
+
+
+def clave_producto(supermercado: str, sku_id: str) -> str:
+    """Identifica un producto entre supermercados: 'dia|12345' (los sku se repiten entre súper)."""
+    return f"{prefs_._normalizar(supermercado).replace(' ', '')}|{sku_id}"
 
 
 def _nombres(claves) -> str:
@@ -62,12 +97,101 @@ def elegir_supermercados(runtime: ToolRuntime) -> Command:
     })
 
 
+# ---------------------------------------------------------------- preferencias
+
+@tool(parse_docstring=True)
+def guardar_preferencia(tipo: TipoPreferencia, valor: str | None = None,
+                        alcance: str = "conversacion", runtime: ToolRuntime = None) -> Command:
+    """Guarda una preferencia del usuario para que las búsquedas la respeten.
+
+    Usala cuando el usuario expresa un gusto o restricción: marcas que no quiere,
+    marcas que prefiere, no querer marcas propias del súper, u otra condición.
+    Traducí lo abstracto a algo concreto: "segundas marcas" no es un dato; si no
+    está claro a qué se refiere, preguntale antes (¿marcas propias del súper?
+    ¿qué marcas prefiere?).
+
+    Alcance: "siempre" solo si lo dijo explícitamente ("siempre", "nunca", "en
+    general", "no me gusta X"). Si fue ambiguo, guardala en "conversacion" y
+    preguntale si quiere que la recuerdes para próximas compras; si dice que sí,
+    volvé a llamarla con "siempre". Si es temporal ("esta vez"), "conversacion".
+
+    Args:
+        tipo: "excluir_marca", "preferir_marca", "excluir_marcas_propias" (las del
+            súper, ej: marca Día en Día) o "nota" (otra condición, ej: "sin TACC";
+            esta no la filtra la herramienta: tenela en cuenta vos al elegir).
+        valor: la marca o el texto de la nota. Vacío para excluir_marcas_propias.
+        alcance: "conversacion" o "siempre".
+    """
+    pref = prefs_.nueva(tipo, valor)
+    if alcance == "siempre":
+        prefs_.guardar(pref, getattr(runtime, "store", None))
+        texto = f"Guardada para siempre: {prefs_.etiqueta(pref)}."
+        actuales = (runtime.state or {}).get("preferencias") or []
+        update = {"preferencias": [p for p in actuales if p["clave"] != pref["clave"]]}
+    else:
+        actuales = (runtime.state or {}).get("preferencias") or []
+        update = {"preferencias": [p for p in actuales if p["clave"] != pref["clave"]] + [pref]}
+        texto = (f"Guardada para esta conversación: {prefs_.etiqueta(pref)}. Si no lo pidió "
+                 f"explícitamente para siempre, preguntale si quiere que la recuerdes.")
+    return Command(update={**update, "messages": [ToolMessage(texto, tool_call_id=runtime.tool_call_id)]})
+
+
+@tool(parse_docstring=True)
+def quitar_preferencia(tipo: TipoPreferencia, valor: str | None = None,
+                       runtime: ToolRuntime = None) -> Command:
+    """Quita una preferencia (de esta conversación y de las guardadas para siempre),
+    cuando el usuario dice que ya no le importa o cambió de idea.
+
+    Args:
+        tipo: el mismo tipo con que se guardó.
+        valor: la misma marca o texto con que se guardó.
+    """
+    clave = prefs_.nueva(tipo, valor)["clave"]
+    prefs_.borrar(clave, getattr(runtime, "store", None))
+    actuales = (runtime.state or {}).get("preferencias") or []
+    texto = f"Preferencia quitada: {prefs_.etiqueta(prefs_.nueva(tipo, valor))}."
+    return Command(update={"preferencias": [p for p in actuales if p["clave"] != clave],
+                           "messages": [ToolMessage(texto, tool_call_id=runtime.tool_call_id)]})
+
+
+# ---------------------------------------------------------------- descartar_productos
+
+class ProductoDescartado(BaseModel):
+    supermercado: str = Field(description='Como aparece en los resultados, ej: "Día".')
+    sku_id: str = Field(description="El sku_id del producto en los resultados.")
+
+
+@tool(parse_docstring=True)
+def descartar_productos(busqueda: str, productos: list[ProductoDescartado], motivo: str,
+                        runtime: ToolRuntime = None) -> Command:
+    """Registra los resultados de una búsqueda que no corresponden a lo que pidió el
+    usuario, para que no se le ofrezcan (lista para el carrito) ni se usen al optimizar.
+
+    Llamala SIEMPRE que descartes resultados, antes de responder: no alcanza con
+    decirlo en el texto. Ej: buscando cereales de desayuno, una jardinera de legumbres
+    o unas galletitas de salvado.
+
+    Args:
+        busqueda: el MISMO texto usado en buscar_productos.
+        productos: los que no corresponden, con su supermercado y sku_id.
+        motivo: por qué no corresponden, en pocas palabras.
+    """
+    descartados = dict((runtime.state or {}).get("descartados") or {})
+    clave_busqueda = prefs_._normalizar(busqueda)
+    nuevos = [clave_producto(p.supermercado, p.sku_id) for p in
+              (x if isinstance(x, ProductoDescartado) else ProductoDescartado(**x) for x in productos)]
+    descartados[clave_busqueda] = list(dict.fromkeys(descartados.get(clave_busqueda, []) + nuevos))
+    texto = f"Ocultados {len(nuevos)} resultados de '{busqueda}' ({motivo})."
+    return Command(update={"descartados": descartados,
+                           "messages": [ToolMessage(texto, tool_call_id=runtime.tool_call_id)]})
+
+
 # ---------------------------------------------------------------- buscar_productos
 
-def _formatear(prod) -> dict:
+def _formatear(prod, preferida: bool = False) -> dict:
     """Solo los campos que el modelo necesita, para no llenar el contexto.
     El supermercado no va acá porque los resultados ya vienen agrupados por súper."""
-    return {
+    return ({"marca_preferida": True} if preferida else {}) | {
         "sku_id": prod.sku_id,
         "nombre": prod.nombre,
         "marca": prod.marca,
@@ -99,13 +223,18 @@ def buscar_productos(producto: str, cantidad_por_super: int = 3,
     buscar en todos y filtrar después. Si lo omitís, se usan los que el usuario eligió
     con elegir_supermercados en esta conversación (o todos, si no eligió).
 
-    Usá términos específicos que incluyan tipo y, si importa, presentación
-    (ej: "leche entera 1 litro", "yerba mate 1 kg"). Una búsqueda genérica
-    como "leche" puede traer productos no deseados (ej: chocolates con leche):
-    revisá la categoría de cada resultado y descartá los que no correspondan.
+    Empezá buscando con las palabras del usuario, sin agregar detalles que no dijo
+    (si pide "leche", buscá "leche"). La respuesta trae `variantes` (marcas y
+    presentaciones encontradas): usalas para ofrecerle al final afinar la búsqueda
+    con algo más específico (tipo, marca, tamaño) o quedarse con lo más barato.
+    Revisá la categoría de cada resultado: los que no correspondan (ej: chocolates
+    al buscar "leche") registralos con descartar_productos antes de responder.
+
+    Ya aplica las preferencias del usuario (marcas a evitar o preferidas): lo que
+    se descartó por eso viene en `descartados_por_preferencias`.
 
     Args:
-        producto: texto a buscar, lo más específico posible.
+        producto: texto a buscar, con las palabras del usuario o afinado si él lo pidió.
         cantidad_por_super: cantidad de opciones a devolver por supermercado (1 a 5).
         supermercados: opcional, limita la búsqueda a estos supermercados. Valores
             válidos: "vea", "jumbo", "carrefour", "changomas", "dia". Si se omite,
@@ -123,7 +252,8 @@ def buscar_productos(producto: str, cantidad_por_super: int = 3,
     with ThreadPoolExecutor(max_workers=len(elegidos)) as pool:
         resultados = list(pool.map(lambda a: _buscar_en(a, producto), elegidos))
 
-    por_super, errores, mejor, todos = {}, [], None, []
+    prefs = _preferencias(runtime)
+    por_super, errores, mejor, todos, descartados, vistos = {}, [], None, [], 0, []
     for nombre, productos, error in resultados:
         if error:
             # un supermercado que falla no corta la búsqueda en los demás
@@ -135,15 +265,21 @@ def buscar_productos(producto: str, cantidad_por_super: int = 3,
         disponibles = [p for p in productos if p.disponible and _es_relevante(p.nombre, producto)]
         # primero los que tienen precio unitario (ordenados), al final los que no
         disponibles.sort(key=lambda p: (p.precio_unitario is None, p.precio_unitario or 0))
+        todos.extend(disponibles)  # a la cache van todos (las preferencias se aplican al leer)
+
+        # preferencias: se sacan las marcas a evitar y las preferidas pasan adelante
+        disponibles, n = prefs_.aplicar(disponibles, prefs)
+        descartados += n
         if not disponibles:
             continue
-        todos.extend(disponibles)  # a la cache van todos, no solo los que ve el modelo
+        vistos.extend(disponibles)
 
-        por_super[nombre] = [_formatear(p) for p in disponibles[:cantidad]]
+        por_super[nombre] = [_formatear(p, prefs_.es_preferida(p, prefs)) for p in disponibles[:cantidad]]
 
         # el más barato global (solo comparable si tiene precio unitario)
-        top = disponibles[0]
-        if top.precio_unitario and (mejor is None or top.precio_unitario < mejor.precio_unitario):
+        con_unitario = [p for p in disponibles if p.precio_unitario]
+        top = min(con_unitario, key=lambda p: p.precio_unitario) if con_unitario else None
+        if top and (mejor is None or top.precio_unitario < mejor.precio_unitario):
             mejor = top
 
     # optimizar_compra lee de acá, sin nuevos requests. Se reemplazan solo los súper que
@@ -160,6 +296,12 @@ def buscar_productos(producto: str, cantidad_por_super: int = 3,
             "precio_unitario": mejor.precio_unitario,
             "unidad_precio": ETIQUETA_UNIDAD.get(mejor.unidad),
         }
+    if vistos:
+        respuesta["variantes"] = _variantes(vistos)
+    if prefs:
+        respuesta["preferencias_aplicadas"] = [prefs_.etiqueta(p) for p in prefs]
+    if descartados:
+        respuesta["descartados_por_preferencias"] = descartados
     if errores:
         respuesta["errores"] = errores
     if not por_super:
@@ -255,6 +397,8 @@ def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = 
         return {"error": f"Supermercado desconocido: {desconocidos}. "
                          f"Opciones válidas: {list(SUPERMERCADOS)}"}
     nombres_permitidos = {SUPERMERCADOS[s].nombre for s in claves}
+    prefs = _preferencias(runtime)
+    descartados = (getattr(runtime, "state", None) or {}).get("descartados") or {}
 
     for item in items:
         item = item if isinstance(item, ItemCompra) else ItemCompra(**item)
@@ -263,6 +407,10 @@ def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = 
             sin_buscar.append(item.busqueda)
             continue
         productos = [p for p in productos if p.supermercado in nombres_permitidos]
+        productos, _ = prefs_.aplicar(productos, prefs)
+        # los que el modelo marcó como que no corresponden no pueden salir como "más barato"
+        fuera = set(descartados.get(prefs_._normalizar(item.busqueda), []))
+        productos = [p for p in productos if clave_producto(p.supermercado, p.sku_id) not in fuera]
         if item.unidad.lower() not in UNIDADES:
             unidad_invalida.append(f"{item.busqueda} ({item.unidad})")
             continue
