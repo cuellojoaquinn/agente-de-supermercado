@@ -40,11 +40,25 @@ def _modelo_compatible(modelo: str, base_url: str, api_key: str, nombre: str, **
                           temperature=0.3, **kwargs)
 
 
-def get_model():
-    proveedor = os.getenv("PROVEEDOR", "gemini").lower()
+def modelos_disponibles() -> dict[str, str]:
+    """Un modelo por proveedor, según el .env: {proveedor: modelo}."""
+    return {
+        "gemini": os.getenv("MODELO", "gemini-3.8-flash"),
+        "opencode": os.getenv("MODELO_OPENCODE", "deepseek-v4.1-flash-free"),
+        "lmstudio": os.getenv("MODELO_LOCAL", "qwen/qwen3.5-9b"),
+    }
+
+
+def proveedor_default() -> str:
+    return os.getenv("PROVEEDOR", "gemini").lower()
+
+
+def get_model(proveedor: str | None = None):
+    """Sin argumento usa PROVEEDOR del .env."""
+    proveedor = (proveedor or proveedor_default()).lower()
+    modelo = modelos_disponibles()[proveedor] if proveedor in modelos_disponibles() else None
 
     if proveedor == "lmstudio":
-        modelo = os.getenv("MODELO_LOCAL", "qwen/qwen3.5-9b")
         print(f"🤖 usando {modelo} (local, LM Studio)")
         return _modelo_compatible(
             modelo,
@@ -56,7 +70,6 @@ def get_model():
         )
 
     if proveedor == "opencode":
-        modelo = os.getenv("MODELO_OPENCODE", "deepseek-v4.1-flash-free")
         print(f"🤖 usando {modelo} (OpenCode Zen)")
         return _modelo_compatible(
             modelo,
@@ -73,7 +86,7 @@ def get_model():
             },
         )
 
-    modelo = os.getenv("MODELO", "gemini-3.8-flash")
+    modelo = modelos_disponibles()["gemini"]
     print(f"🤖 usando {modelo}")          # para confirmar que el .env no lo pisa
     return _modelo_gemini(modelo)
 

@@ -1,8 +1,9 @@
 from langchain.agents import create_agent
-from langgraph.checkpoint.memory import InMemorySaver
 from model import get_model
 from langchain_google_genai.chat_models import GoogleAPIError, GoogleRateLimitError
 from tools import buscar_productos, optimizar_compra
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 SYSTEM_PROMPT = """Sos un asistente que ayuda a ahorrar en compras de supermercado en Argentina.
 - Nunca inventes precios: obtenelos siempre con las herramientas.
@@ -10,14 +11,30 @@ SYSTEM_PROMPT = """Sos un asistente que ayuda a ahorrar en compras de supermerca
 - Descartá resultados cuya categoría no corresponda a lo que pidió el usuario.
 - Respondé en español, con montos en pesos."""
 
+# Nos pide poder mostrar una memoria corto plazo. Corto plazo: solamente consultar mensajes de esta conversacion.
+# El problema: es que no persisto y no las puedo retomar. checkpoint con sql lite.
+# Memoria persistente: un checkpoint por paso del grafo, separado por thread_id.
+# check_same_thread=False porque Streamlit atiende cada rerun en un hilo distinto.
+checkpointer = SqliteSaver(sqlite3.connect("checkpoints.db", check_same_thread=False))
+checkpointer.setup()  # crea las tablas si la base es nueva
 
-def crear_agente():
+
+def crear_agente(proveedor: str | None = None):
     return create_agent(
-        model=get_model(),
+        model=get_model(proveedor),
         tools=[buscar_productos, optimizar_compra],
         system_prompt=SYSTEM_PROMPT,
-        checkpointer=InMemorySaver(), # Nos pide poder mostrar una memoria corto plazo. Corto plazo: solamente consultar mensajes de esta conversacion. El problema: es que no persisto y no las puedo retomar. checkpoint con sql lite. Destaquen como funciona la tool explicar a detalle la tool.
+        checkpointer=checkpointer,
     )
+
+
+def listar_conversaciones() -> list[str]:
+    """thread_id guardados, de la conversación más reciente a la más vieja."""
+    with checkpointer.lock:  # la conexión es compartida con el agente
+        filas = checkpointer.conn.execute(
+            "SELECT thread_id FROM checkpoints GROUP BY thread_id ORDER BY MAX(checkpoint_id) DESC"
+        ).fetchall()
+    return [fila[0] for fila in filas]
 
 
 def mensaje_error(e: Exception) -> str | None:

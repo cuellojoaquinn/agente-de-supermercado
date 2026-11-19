@@ -4,25 +4,28 @@ Cubre la consigna:
 - 3.4: chat con st.chat_input / st.chat_message, respuestas renderizadas en markdown.
 - 3.5: en streaming, cada paso apenas termina: razonamiento (diferenciado, en un expander),
   cada tool con sus argumentos y un resumen del resultado, en orden.
-- 3.3: memoria con checkpointer (agente cacheado + thread_id en session_state).
+- 3.3: memoria con checkpointer SQLite (thread_id en session_state); las conversaciones
+  guardadas se listan en la barra lateral (por fecha, con buscador) y se pueden retomar.
 - 4: errores de cuota/proveedor como mensaje claro, sin traceback.
 
 Correr con:  streamlit run app.py
 """
 import json
-import os
+import unicodedata
 import uuid
+from datetime import date, datetime
 
 import streamlit as st
 
-from agente import crear_agente, mensaje_error
+from agente import crear_agente, listar_conversaciones, mensaje_error
+from model import modelos_disponibles, proveedor_default
 
 st.set_page_config(page_title="Super-agente", page_icon="🛒")
 
 
 # ------------------------------------------------------------------ agente y memoria
 
-@st.cache_resource  # una sola instancia: si se recrea en cada rerun, el InMemorySaver se pierde
+@st.cache_resource  # una sola instancia del agente (la memoria vive en checkpoints.db)
 def get_agente():
     return crear_agente()
 
@@ -34,6 +37,8 @@ def nueva_conversacion():
 
 if "thread_id" not in st.session_state:
     nueva_conversacion()
+
+MODELO_ACTUAL = modelos_disponibles()[proveedor_default()]  # el del .env (PROVEEDOR)
 
 agente = get_agente()
 config = {"configurable": {"thread_id": st.session_state.thread_id}}
@@ -166,22 +171,95 @@ def ejecutar(pregunta: str) -> dict:
     return turno
 
 
+# ------------------------------------------------------------------ retomar conversaciones
+
+def mensajes_de(thread_id: str) -> list:
+    """Lee del checkpointer (SQLite) los mensajes del último checkpoint de ese hilo."""
+    estado = agente.get_state({"configurable": {"thread_id": thread_id}})
+    return estado.values.get("messages", [])  # hilo sin checkpoints -> {}
+
+
+def historial_desde_estado(thread_id: str) -> list[dict]:
+    """Rearma los turnos de la UI desde los mensajes guardados, con los mismos pasos que en vivo."""
+    historial = []
+    for msg in mensajes_de(thread_id):
+        if msg.type == "human":
+            historial.append({"rol": "user", "texto": msg.text})
+            historial.append({"rol": "assistant", "pasos": [], "respuesta": None, "error": None})
+        elif historial:  # "ai" -> nodo model, "tool" -> nodo tools
+            pasos, respuesta = pasos_de_mensaje("model" if msg.type == "ai" else "tools", msg)
+            historial[-1]["pasos"].extend(pasos)
+            if respuesta:
+                historial[-1]["respuesta"] = respuesta
+    return historial
+
+
+def _normalizar(texto: str) -> str:
+    """Minúsculas y sin tildes, para que 'azucar' encuentre 'azúcar'."""
+    sin_tildes = unicodedata.normalize("NFD", texto.lower())
+    return "".join(c for c in sin_tildes if unicodedata.category(c) != "Mn")
+
+
+def resumen(thread_id: str) -> dict:
+    """Título (primera pregunta), texto completo para el buscador y fecha del último mensaje."""
+    estado = agente.get_state({"configurable": {"thread_id": thread_id}})
+    mensajes = estado.values.get("messages", [])
+    preguntas = [m.text for m in mensajes if m.type == "human"]
+    titulo = preguntas[0] if preguntas else "(vacía)"
+    return {
+        "thread_id": thread_id,
+        "titulo": titulo if len(titulo) <= 38 else titulo[:38] + "…",
+        "texto": _normalizar(" ".join(m.text for m in mensajes if m.type in ("human", "ai"))),
+        "fecha": datetime.fromisoformat(estado.created_at).astimezone().date(),
+    }
+
+
+def grupo_de_fecha(fecha: date) -> str:
+    dias = (date.today() - fecha).days
+    if dias <= 0:
+        return "Hoy"
+    if dias == 1:
+        return "Ayer"
+    if dias <= 7:
+        return "Últimos 7 días"
+    return "Anteriores"
+
+
+def retomar(thread_id: str):
+    st.session_state.thread_id = thread_id
+    st.session_state.historial = historial_desde_estado(thread_id)
+
+
+def dibujar_historial_conversaciones():
+    """Lista estilo ChatGPT/Claude: buscador + conversaciones agrupadas por fecha."""
+    busqueda = _normalizar(st.text_input("Buscar", placeholder="🔎 Buscar conversaciones",
+                                         label_visibility="collapsed"))
+    conversaciones = [resumen(t) for t in listar_conversaciones()]  # ya vienen de la más reciente
+    if busqueda:
+        conversaciones = [c for c in conversaciones if busqueda in c["texto"]]
+    if not conversaciones:
+        st.caption("Sin resultados." if busqueda else "Todavía no hay conversaciones guardadas.")
+        return
+    grupo_actual = None
+    for c in conversaciones:
+        if (grupo := grupo_de_fecha(c["fecha"])) != grupo_actual:
+            st.caption(grupo)
+            grupo_actual = grupo
+        st.button(c["titulo"], key=f"conv-{c['thread_id']}", use_container_width=True,
+                  type="primary" if c["thread_id"] == st.session_state.thread_id else "secondary",
+                  on_click=retomar, args=(c["thread_id"],))
+
+
 # ------------------------------------------------------------------ página
 
 with st.sidebar:
     st.header("🛒 Super-agente")
-    st.caption("Compara precios en Vea, Jumbo, Carrefour, ChangoMás y Día.")
-    proveedor = os.getenv("PROVEEDOR", "gemini")
-    modelo = {"opencode": os.getenv("MODELO_OPENCODE"), "lmstudio": os.getenv("MODELO_LOCAL")}.get(
-        proveedor, os.getenv("MODELO"))
-    st.markdown(f"**Modelo:** `{modelo}` ({proveedor})")
-    st.markdown(f"**Conversación:** `{st.session_state.thread_id[:8]}`")
     if st.button("🆕 Nueva conversación", use_container_width=True):
         nueva_conversacion()
         st.rerun()
+    dibujar_historial_conversaciones()
     st.divider()
-    st.markdown("**Probá la memoria:**\n1. *¿Cuánto sale la leche entera por litro?*\n"
-                "2. *¿Y si son 3 litros, dónde me conviene?*")
+    st.caption("Compara precios en Vea, Jumbo, Carrefour, ChangoMás y Día.")
 
 st.title("Asistente de compras")
 
@@ -193,6 +271,12 @@ for turno in st.session_state.historial:
         else:
             dibujar_turno_asistente(turno)
 
+# nombre del modelo junto al cuadro de chat, fijo abajo como en ChatGPT/Claude
+# (st.bottom es el contenedor donde Streamlit fija el chat_input)
+with st.bottom:
+    st.markdown(f"<div style='text-align:right;font-size:0.8rem;opacity:0.6'>{MODELO_ACTUAL}</div>",
+                unsafe_allow_html=True)
+
 if pregunta := st.chat_input("Ej: tengo que comprar 2 L de leche y 1 kg de yerba, ¿dónde me conviene?"):
     st.session_state.historial.append({"rol": "user", "texto": pregunta})
     with st.chat_message("user"):
@@ -200,3 +284,4 @@ if pregunta := st.chat_input("Ej: tengo que comprar 2 L de leche y 1 kg de yerba
     with st.chat_message("assistant"):
         turno = ejecutar(pregunta)
     st.session_state.historial.append({"rol": "assistant", **turno})
+    st.rerun()  # la barra lateral ya se dibujó: recargar para que la conversación aparezca en el selector
