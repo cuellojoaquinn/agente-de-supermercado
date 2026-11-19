@@ -24,7 +24,7 @@ from agente import crear_agente, listar_conversaciones, mensaje_error
 from model import modelos_disponibles, proveedor_default
 from supermercados import SUPERMERCADOS
 from langgraph.types import Command
-from tools import clave_producto
+from tools import Contexto, clave_producto
 
 st.set_page_config(page_title="Super-agente", page_icon="🛒")
 
@@ -91,9 +91,20 @@ def resumir_resultado(nombre: str, contenido) -> str:
             partes.append(f"compra mixta {_pesos(mixta['total'])} ({', '.join(lugares)})")
         if mejor := datos.get("mejor_un_solo_super"):
             partes.append(f"todo en **{mejor['supermercado']}** {_pesos(mejor['total'])}")
+        if limitada := datos.get("mejor_con_max_supermercados"):
+            partes.append(f"con máximo {limitada['max_supermercados']} súper {_pesos(limitada['total'])}")
         if datos.get("sin_buscar"):
             partes.append(f"⚠️ sin buscar antes: {', '.join(datos['sin_buscar'])}")
         return " · ".join(partes) or "sin resultados"
+
+    if nombre == "optimizar_carrito":
+        if datos.get("error"):
+            return f"⚠️ {datos['error']}"
+        partes = [f"hoy {_pesos(datos['total_actual'])} → optimizado {_pesos(datos['total_optimizado'])}",
+                  f"ahorro **{_pesos(datos['ahorro'])}** con {len(datos['cambios'])} cambios"]
+        if datos.get("otras_marcas_mas_baratas"):
+            partes.append(f"{len(datos['otras_marcas_mas_baratas'])} con otra marca más barata")
+        return " · ".join(partes)
 
     return json.dumps(datos, ensure_ascii=False)[:200]
 
@@ -136,14 +147,16 @@ def _clave_producto(supermercado: str, prod: dict) -> str:
     return f"{supermercado}|{prod['sku_id']}"
 
 
-def agregar_al_carrito(supermercado: str, prod: dict):
+def agregar_al_carrito(supermercado: str, prod: dict, busqueda: str):
     carrito = st.session_state.carrito
     clave = _clave_producto(supermercado, prod)
     if clave in carrito:
         carrito[clave]["cantidad"] += 1
     else:
-        carrito[clave] = {"supermercado": supermercado, "nombre": prod["nombre"],
-                          "marca": prod.get("marca"), "precio": prod["precio"], "cantidad": 1}
+        # busqueda y sku_id: para que optimizar_carrito encuentre el producto y sus alternativas
+        carrito[clave] = {"supermercado": supermercado, "nombre": prod["nombre"], "marca": prod.get("marca"),
+                          "precio": prod["precio"], "cantidad": 1, "sku_id": prod["sku_id"],
+                          "busqueda": busqueda}
     st.toast(f"🛒 Agregado: {prod['nombre']}")
 
 
@@ -200,7 +213,7 @@ def dibujar_productos(turno: dict, indice: int):
                     col_precio.markdown(f"{_pesos(prod['precio'])}{unitario}", unsafe_allow_html=True)
                     col_boton.button("➕", key=f"add-{indice}-{j}-{_clave_producto(supermercado, prod)}",
                                      help="Agregar al carrito", on_click=agregar_al_carrito,
-                                     args=(supermercado, prod))
+                                     args=(supermercado, prod, datos.get("busqueda")))
 
 
 def dibujar_carrito():
@@ -227,6 +240,10 @@ def dibujar_carrito():
         st.markdown(f"**Total: {_pesos(total)}**")
         if len(por_super) > 1:
             st.caption(f"Comprás en {len(por_super)} supermercados distintos.")
+        if st.button("✨ Optimizar carrito", use_container_width=True, type="primary",
+                     disabled=bool(st.session_state.en_curso)):
+            st.session_state.pregunta_programada = "Optimizá mi carrito"
+            st.rerun()
         if st.button("Vaciar carrito", use_container_width=True):
             carrito.clear()
             st.rerun()
@@ -291,7 +308,9 @@ def ejecutar(entrada, turno: dict | None = None) -> dict:
     turno["esperando"] = False
     with st.status("Pensando...", expanded=True) as estado:
         try:
-            for chunk in agente.stream(entrada, config, stream_mode="updates"):
+            # el carrito es estado local de la UI: se le pasa al agente en cada mensaje
+            contexto = Contexto(carrito=list(st.session_state.carrito.values()))
+            for chunk in agente.stream(entrada, config, context=contexto, stream_mode="updates"):
                 for nodo, data in chunk.items():
                     if nodo == "__interrupt__":  # una tool pidió la intervención del usuario
                         turno["esperando"] = True
@@ -498,8 +517,10 @@ if turno_en_curso := st.session_state.en_curso:
             tarjeta.empty()  # se reemplaza la tarjeta por la continuación en vivo
             terminar_turno(ejecutar(Command(resume=elegidos), turno_en_curso))
 
-if pregunta := st.chat_input("Ej: tengo que comprar 2 L de leche y 1 kg de yerba, ¿dónde me conviene?",
-                             disabled=bool(st.session_state.en_curso)):
+pregunta = st.chat_input("Ej: tengo que comprar 2 L de leche y 1 kg de yerba, ¿dónde me conviene?",
+                         disabled=bool(st.session_state.en_curso))
+pregunta = pregunta or st.session_state.pop("pregunta_programada", None)  # botones como "Optimizar carrito"
+if pregunta:
     st.session_state.historial.append({"rol": "user", "texto": pregunta})
     with st.chat_message("user"):
         st.markdown(pregunta)

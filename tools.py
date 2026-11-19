@@ -3,6 +3,8 @@ import re
 import unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Annotated, NotRequired
 from langchain.agents import AgentState
 from langchain.messages import ToolMessage
@@ -17,6 +19,13 @@ from supermercados import SUPERMERCADOS
 RESULTADOS_POR_SUPER = 20   # cuántos traemos de cada API para después ordenar nosotros
 MAX_POR_SUPER = 5           # tope de lo que devolvemos por súper (cuidado del contexto)
 ETIQUETA_UNIDAD = {"ml": "$/L", "g": "$/kg", "un": "$/un", "m": "$/m", "m2": "$/m2"}
+
+
+@dataclass
+class Contexto:
+    """Lo que la UI le pasa al agente en cada mensaje. carrito: los ítems del carrito
+    (estado local de la sesión), para que optimizar_carrito los pueda ver."""
+    carrito: list[dict] = field(default_factory=list)
 
 
 # Reducers: el modelo puede llamar varias tools en paralelo en el mismo paso (ej: un
@@ -104,7 +113,7 @@ def _nombres(claves) -> str:
 # ---------------------------------------------------------------- elegir_supermercados
 
 @tool
-def elegir_supermercados(runtime: ToolRuntime) -> Command:
+def elegir_supermercados(runtime: ToolRuntime[Contexto]) -> Command:
     """Le pregunta al usuario en qué supermercados buscar, con una ventana para elegir.
 
     Usala UNA vez, sola y antes de buscar_productos, cuando el usuario pide comparar
@@ -129,7 +138,7 @@ def elegir_supermercados(runtime: ToolRuntime) -> Command:
 
 @tool(parse_docstring=True)
 def guardar_preferencia(tipo: TipoPreferencia, valor: str | None = None,
-                        alcance: str = "conversacion", runtime: ToolRuntime = None) -> Command:
+                        alcance: str = "conversacion", runtime: ToolRuntime[Contexto] = None) -> Command:
     """Guarda una preferencia del usuario para que las búsquedas la respeten.
 
     Usala cuando el usuario expresa un gusto o restricción: marcas que no quiere,
@@ -165,7 +174,7 @@ def guardar_preferencia(tipo: TipoPreferencia, valor: str | None = None,
 
 @tool(parse_docstring=True)
 def quitar_preferencia(tipo: TipoPreferencia, valor: str | None = None,
-                       runtime: ToolRuntime = None) -> Command:
+                       runtime: ToolRuntime[Contexto] = None) -> Command:
     """Quita una preferencia (de esta conversación y de las guardadas para siempre),
     cuando el usuario dice que ya no le importa o cambió de idea.
 
@@ -189,7 +198,7 @@ class ProductoDescartado(BaseModel):
 
 @tool(parse_docstring=True)
 def descartar_productos(busqueda: str, productos: list[ProductoDescartado], motivo: str,
-                        runtime: ToolRuntime = None) -> Command:
+                        runtime: ToolRuntime[Contexto] = None) -> Command:
     """Registra los resultados de una búsqueda que no corresponden a lo que pidió el
     usuario, para que no se le ofrezcan (lista para el carrito) ni se usen al optimizar.
 
@@ -238,7 +247,7 @@ def _buscar_en(adapter, producto: str):
 @tool(parse_docstring=True)
 def buscar_productos(producto: str, cantidad_por_super: int = 3,
                      supermercados: list[str] | None = None,
-                     runtime: ToolRuntime = None) -> dict:
+                     runtime: ToolRuntime[Contexto] = None) -> dict:
     """Busca un producto en los supermercados disponibles (todos, o solo los indicados)
     y devuelve, para cada supermercado, las opciones más convenientes ordenadas por
     precio unitario ($/L, $/kg o $/un). Sirve para comparar precios entre supermercados.
@@ -395,9 +404,50 @@ def _mejor_opcion(productos, unidad_base: str, cantidad_base: float, busqueda: s
     return mejor
 
 
+def _r(x):
+    return round(x, 2)
+
+
+def _planificar(opciones: dict[str, dict[str, dict]], max_supermercados: int | None = None) -> dict | None:
+    """Mejor forma de comprar todos los pedidos usando como mucho max_supermercados.
+    opciones: {pedido: {supermercado: opción con "subtotal"}}. Prueba todas las combinaciones
+    de supermercados (con 5 súper son 31) y en cada una elige lo más barato de cada pedido."""
+    opciones = {p: ops for p, ops in opciones.items() if ops}
+    supers = sorted({s for ops in opciones.values() for s in ops})
+    tope = min(max_supermercados or len(supers), len(supers))
+    mejor = None
+    for k in range(1, tope + 1):
+        for combo in combinations(supers, k):
+            elegidas = {}
+            for pedido, ops in opciones.items():
+                candidatas = [ops[s] for s in combo if s in ops]
+                if not candidatas:
+                    break   # este combo no cubre el pedido
+                elegidas[pedido] = min(candidatas, key=lambda o: o["subtotal"])
+            else:
+                total = sum(o["subtotal"] for o in elegidas.values())
+                if mejor is None or total < mejor["total"] - 0.005:
+                    usados = sorted({o["supermercado"] for o in elegidas.values()})
+                    mejor = {"total": _r(total), "supermercados": usados, "elegidas": elegidas}
+    return mejor
+
+
+def _por_cantidad_de_supermercados(opciones: dict[str, dict[str, dict]]) -> list[dict]:
+    """Cuánto sale la compra yendo a 1, 2, 3... supermercados: para ver si ir a uno más
+    vale la pena. Solo se listan las cantidades que bajan el total."""
+    filas, anterior = [], None
+    n_supers = len({s for ops in opciones.values() for s in ops})
+    for k in range(1, n_supers + 1):
+        plan = _planificar(opciones, k)
+        if plan and (anterior is None or plan["total"] < anterior - 0.005):
+            filas.append({"max_supermercados": k, "total": plan["total"], "en": plan["supermercados"]})
+            anterior = plan["total"]
+    return filas
+
+
 @tool(parse_docstring=True)
 def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = None,
-                     runtime: ToolRuntime = None) -> dict:
+                     max_supermercados: int | None = None, runtime: ToolRuntime[Contexto] = None) -> dict:
     """Calcula la forma más barata de comprar una lista completa, usando los precios
     ya obtenidos con buscar_productos (no consulta de nuevo los supermercados).
     Compara comprar cada producto donde está más barato (compra mixta) contra
@@ -407,10 +457,16 @@ def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = 
     el mismo texto de búsqueda. Revisá los nombres elegidos: si alguno no corresponde
     a lo pedido, repetí la búsqueda con un término más específico.
 
+    La compra mixta puede repartir la compra en muchos supermercados por poco ahorro:
+    `por_cantidad_de_supermercados` dice cuánto sale yendo a 1, 2, 3... súper; usalo para
+    recomendar si conviene ir a uno más. Si el usuario pone un límite ("máximo 2 súper"),
+    pasalo en max_supermercados.
+
     Args:
         items: productos a comprar, cada uno con busqueda, cantidad y unidad.
         supermercados: opcional, supermercados a comparar (mismos valores que en
             buscar_productos). Si se omite, usa la elección del usuario o todos.
+        max_supermercados: opcional, máximo de supermercados distintos a los que ir.
     """
     sin_buscar, unidad_invalida = [], []
     mixta, por_super = [], {}   # por_super: súper -> {busqueda: opción}
@@ -451,9 +507,6 @@ def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = 
             if opcion:
                 por_super.setdefault(super_, {})[item.busqueda] = opcion
 
-    def _r(x):
-        return round(x, 2)
-
     for d in mixta:
         if "subtotal" in d:
             d["subtotal"] = _r(d["subtotal"])
@@ -480,9 +533,158 @@ def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = 
                          "subtotal": _r(o["subtotal"])}
                         for b, o in por_super[mejor["supermercado"]].items()],
         }
+    # reorganizado por pedido para el planificador: {busqueda: {súper: opción}}
+    opciones = {b: {s: ops[b] for s, ops in por_super.items() if b in ops} for b in pedidos}
+    if len({d["supermercado"] for d in mixta if "supermercado" in d}) > 1:
+        respuesta["por_cantidad_de_supermercados"] = _por_cantidad_de_supermercados(opciones)
+    if max_supermercados and (plan := _planificar(opciones, max_supermercados)):
+        respuesta["mejor_con_max_supermercados"] = {
+            "max_supermercados": max_supermercados, "total": plan["total"],
+            "supermercados": plan["supermercados"],
+            "diferencia_con_compra_mixta": _r(plan["total"] - total_mixta),
+            "detalle": [{"busqueda": b, "supermercado": o["supermercado"], "nombre": o["nombre"],
+                         "envases": o["envases"], "subtotal": _r(o["subtotal"])}
+                        for b, o in plan["elegidas"].items()],
+        }
     if sin_buscar:
         respuesta["sin_buscar"] = sin_buscar
         respuesta["sugerencia"] = "Llamá primero a buscar_productos con estos textos exactos."
     if unidad_invalida:
         respuesta["unidad_invalida"] = unidad_invalida
+    return respuesta
+
+
+# ---------------------------------------------------------------- optimizar_carrito
+
+def _asegurar_cache(busqueda: str, claves: list[str]) -> None:
+    """La cache es del proceso: si la app se reinició, se vuelve a buscar (sin pasar por el modelo)."""
+    if obtener_busqueda(busqueda) is not None:
+        return
+    elegidos = [SUPERMERCADOS[c] for c in claves]
+    with ThreadPoolExecutor(max_workers=len(elegidos)) as pool:
+        resultados = list(pool.map(lambda a: _buscar_en(a, busqueda), elegidos))
+    todos = [p for _, productos, error in resultados if not error for p in productos
+             if p.disponible and _es_relevante(p.nombre, busqueda)]
+    guardar_busqueda(busqueda, todos, {nombre for nombre, _, error in resultados if not error})
+
+
+def _misma_marca(a, b) -> bool:
+    marca_a, marca_b = prefs_._normalizar(a.marca), prefs_._normalizar(b.marca)
+    return marca_a == marca_b if marca_a and marca_b else False
+
+
+def _opcion(prod, cantidad_base: float) -> dict | None:
+    costo = _costo(prod, cantidad_base)
+    if not costo:
+        return None
+    return {"supermercado": prod.supermercado, "nombre": prod.nombre, "sku_id": prod.sku_id,
+            "presentacion": _presentacion(prod), "envases": costo[1], "subtotal": costo[0]}
+
+
+@tool(parse_docstring=True)
+def optimizar_carrito(max_supermercados: int | None = None, runtime: ToolRuntime[Contexto] = None) -> dict:
+    """Revisa el carrito del usuario y dice qué conviene cambiar para pagar menos por
+    lo mismo: el mismo producto en otro supermercado, o la misma marca en otra
+    presentación (ej: 1 envase de 1 L en vez de 2 de 500 ml). Aparte, informa si hay
+    otra marca más barata, por si al usuario le da igual la marca.
+
+    Usala cuando el usuario pide optimizar, revisar o abaratar su carrito. Usa los
+    precios ya buscados (vuelve a buscar solo si hace falta). Explicá los cambios con
+    el ahorro de cada uno; no cambia el carrito: el usuario decide.
+
+    Args:
+        max_supermercados: opcional, máximo de supermercados distintos a los que ir.
+    """
+    carrito = (getattr(getattr(runtime, "context", None), "carrito", None)) or []
+    if not carrito:
+        return {"error": "El carrito está vacío. El usuario agrega productos con ➕ desde los resultados."}
+
+    claves = _validar(_por_defecto(runtime))[0]
+    nombres_permitidos = {SUPERMERCADOS[s].nombre for s in claves}
+    prefs = _preferencias(runtime)
+    descartados = (getattr(runtime, "state", None) or {}).get("descartados") or {}
+
+    opciones, items, otras_marcas, sin_datos = {}, [], [], []
+    for i, item in enumerate(carrito):
+        busqueda = item.get("busqueda")
+        if not busqueda:
+            sin_datos.append(item["nombre"])
+            continue
+        _asegurar_cache(busqueda, claves)
+        productos = obtener_busqueda(busqueda) or []
+        clave_actual = clave_producto(item["supermercado"], item["sku_id"])
+        actual = next((p for p in productos if clave_producto(p.supermercado, p.sku_id) == clave_actual), None)
+        if actual is None or not actual.unidad:
+            sin_datos.append(item["nombre"])
+            continue
+
+        # cuánto lleva el usuario, en unidad base (ml, g o un)
+        cantidad_base = item["cantidad"] * (1000 if actual.venta_por_peso else (actual.contenido or 0))
+        if not cantidad_base:
+            sin_datos.append(item["nombre"])
+            continue
+        costo_actual = item["precio"] * item["cantidad"]
+        fuera = set(descartados.get(prefs_._normalizar(busqueda), []))
+        candidatos = [p for p in productos
+                      if p.unidad == actual.unidad and p.supermercado in nombres_permitidos | {actual.supermercado}
+                      and clave_producto(p.supermercado, p.sku_id) not in fuera]
+        candidatos, _ = prefs_.aplicar(candidatos, prefs)
+
+        # lo que tiene hoy, con el precio del carrito (la cache puede tener otro)
+        pedido = f"{i}:{item['nombre']}"
+        hoy = {"supermercado": actual.supermercado, "nombre": actual.nombre, "sku_id": actual.sku_id,
+               "presentacion": _presentacion(actual), "envases": item["cantidad"], "subtotal": costo_actual}
+        opciones[pedido] = {actual.supermercado: hoy}
+        # misma marca, en cualquier súper y presentación: la opción más barata de cada súper
+        for p in candidatos:
+            if not _misma_marca(p, actual):
+                continue
+            o = _opcion(p, cantidad_base)
+            previa = opciones[pedido].get(p.supermercado)
+            if o and (previa is None or o["subtotal"] < previa["subtotal"]):
+                opciones[pedido][p.supermercado] = o
+        items.append((pedido, item, actual, costo_actual, cantidad_base, candidatos))
+
+    if not items:
+        return {"error": "No se encontraron los productos del carrito en las búsquedas. "
+                         "Volvé a buscarlos y agregalos de nuevo.", "sin_datos": sin_datos}
+
+    plan = _planificar(opciones, max_supermercados)
+    total_actual = sum(costo for _, _, _, costo, _, _ in items)
+    cambios, sin_cambios = [], []
+    for pedido, item, actual, costo_actual, cantidad_base, candidatos in items:
+        elegida = plan["elegidas"][pedido]
+        ahorro = costo_actual - elegida["subtotal"]
+        if ahorro > 0.5:
+            mismo_super = elegida["supermercado"] == item["supermercado"]
+            cambios.append({
+                "producto": item["nombre"], "en_el_carrito": f"{item['cantidad']} × {item['supermercado']}",
+                "tipo": "presentación" if mismo_super else (
+                    "supermercado" if elegida["presentacion"] == _presentacion(actual)
+                    else "supermercado y presentación"),
+                "cambiar_por": f"{elegida['envases']:g} × {elegida['nombre']} en {elegida['supermercado']}",
+                "ahorro": _r(ahorro)})
+        else:
+            sin_cambios.append(item["nombre"])
+        # otra marca más barata (solo informativo: el usuario eligió esa marca)
+        otras = [o for p in candidatos if not _misma_marca(p, actual) and (o := _opcion(p, cantidad_base))]
+        mas_barata = min(otras, key=lambda o: o["subtotal"], default=None)
+        if mas_barata and mas_barata["subtotal"] < elegida["subtotal"] * 0.95:   # al menos 5% menos
+            otras_marcas.append({"en_vez_de": item["nombre"],
+                                 "opcion": f"{mas_barata['envases']:g} × {mas_barata['nombre']} en {mas_barata['supermercado']}",
+                                 "ahorro_extra": _r(elegida["subtotal"] - mas_barata["subtotal"])})
+
+    respuesta = {
+        "total_actual": _r(total_actual), "supermercados_actual": sorted({it["supermercado"] for _, it, *_ in items}),
+        "total_optimizado": plan["total"], "supermercados_optimizado": plan["supermercados"],
+        "ahorro": _r(total_actual - plan["total"]), "cambios": cambios, "sin_cambios": sin_cambios,
+    }
+    if max_supermercados:
+        respuesta["max_supermercados"] = max_supermercados
+    if len(plan["supermercados"]) > 1:
+        respuesta["por_cantidad_de_supermercados"] = _por_cantidad_de_supermercados(opciones)
+    if otras_marcas:
+        respuesta["otras_marcas_mas_baratas"] = otras_marcas
+    if sin_datos:
+        respuesta["sin_datos"] = sin_datos
     return respuesta
