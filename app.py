@@ -7,6 +7,8 @@ Cubre la consigna:
 - 3.3: memoria con checkpointer SQLite (thread_id en session_state); las conversaciones
   guardadas se listan en la barra lateral (por fecha, con buscador) y se pueden retomar.
 - 4: errores de cuota/proveedor como mensaje claro, sin traceback.
+- Preferencias (conversación y largo plazo) como chips en la barra lateral, y carrito:
+  los productos encontrados se pueden agregar a un carrito (estado local de la sesión).
 
 Correr con:  streamlit run app.py
 """
@@ -17,10 +19,12 @@ from datetime import date, datetime
 
 import streamlit as st
 
+import preferencias
 from agente import crear_agente, listar_conversaciones, mensaje_error
 from model import modelos_disponibles, proveedor_default
 from supermercados import SUPERMERCADOS
 from langgraph.types import Command
+from tools import clave_producto
 
 st.set_page_config(page_title="Super-agente", page_icon="🛒")
 
@@ -40,6 +44,7 @@ def nueva_conversacion():
 
 if "thread_id" not in st.session_state:
     nueva_conversacion()
+st.session_state.setdefault("carrito", {})  # estado local: no se guarda en la base
 st.session_state.setdefault("en_curso", None)  # sesiones abiertas antes de este cambio
 
 MODELO_ACTUAL = modelos_disponibles()[proveedor_default()]  # el del .env (PROVEEDOR)
@@ -71,6 +76,8 @@ def resumir_resultado(nombre: str, contenido) -> str:
         if mb := datos.get("mas_barato"):
             partes.append(f"el más barato: **{mb['nombre']}** en {mb['supermercado']} "
                           f"({_pesos(mb['precio_unitario'])}{(mb.get('unidad_precio') or '').removeprefix('$')})")
+        if n := datos.get("descartados_por_preferencias"):
+            partes.append(f"{n} descartados por tus preferencias")
         if datos.get("errores"):
             partes.append(f"⚠️ {len(datos['errores'])} súper con error")
         if datos.get("sugerencia"):
@@ -108,7 +115,8 @@ def dibujar_paso(paso: dict):
         st.markdown(f"✅ `{paso['nombre']}` → {paso['resumen']}")
 
 
-def dibujar_turno_asistente(turno: dict):
+def dibujar_turno_asistente(turno: dict, indice: int | None = None):
+    """indice: posición en el historial; si viene, se muestran los productos para el carrito."""
     if turno["pasos"]:
         n_tools = sum(p["tipo"] == "tool_call" for p in turno["pasos"])
         with st.expander(f"🔍 Qué hizo el agente ({n_tools} llamadas a herramientas)"):
@@ -118,6 +126,136 @@ def dibujar_turno_asistente(turno: dict):
         st.error(turno["error"])
     if turno.get("respuesta"):
         st.markdown(turno["respuesta"])
+    if indice is not None:
+        dibujar_productos(turno, indice)
+
+
+# ------------------------------------------------------------------ carrito (estado local)
+
+def _clave_producto(supermercado: str, prod: dict) -> str:
+    return f"{supermercado}|{prod['sku_id']}"
+
+
+def agregar_al_carrito(supermercado: str, prod: dict):
+    carrito = st.session_state.carrito
+    clave = _clave_producto(supermercado, prod)
+    if clave in carrito:
+        carrito[clave]["cantidad"] += 1
+    else:
+        carrito[clave] = {"supermercado": supermercado, "nombre": prod["nombre"],
+                          "marca": prod.get("marca"), "precio": prod["precio"], "cantidad": 1}
+    st.toast(f"🛒 Agregado: {prod['nombre']}")
+
+
+def cambiar_cantidad(clave: str, delta: int):
+    item = st.session_state.carrito[clave]
+    item["cantidad"] += delta
+    if item["cantidad"] <= 0:
+        del st.session_state.carrito[clave]
+
+
+def descartados_en_historial() -> dict[str, set[str]]:
+    """Lo que el modelo marcó con descartar_productos en cualquier turno: {búsqueda: claves}."""
+    descartados = {}
+    for turno in st.session_state.historial:
+        for paso in turno.get("pasos", []):
+            if paso["tipo"] == "tool_call" and paso["nombre"] == "descartar_productos":
+                args = paso["args"]
+                claves = {clave_producto(p["supermercado"], p["sku_id"]) for p in args.get("productos", [])}
+                descartados.setdefault(preferencias._normalizar(args.get("busqueda")), set()).update(claves)
+    return descartados
+
+
+def dibujar_productos(turno: dict, indice: int):
+    """Por cada búsqueda del turno, los productos encontrados con un botón para el carrito.
+    No se ofrecen los que el modelo descartó por no corresponder a lo pedido."""
+    descartados = descartados_en_historial()
+    busquedas = [p for p in turno["pasos"]
+                 if p["tipo"] == "tool_result" and p["nombre"] == "buscar_productos"
+                 and (p.get("datos") or {}).get("por_supermercado")]
+    for j, paso in enumerate(busquedas):
+        datos = paso["datos"]
+        fuera = descartados.get(preferencias._normalizar(datos.get("busqueda")), set())
+        por_super = {sup: [p for p in prods if clave_producto(sup, p["sku_id"]) not in fuera]
+                     for sup, prods in datos["por_supermercado"].items()}
+        por_super = {sup: prods for sup, prods in por_super.items() if prods}
+        n = sum(len(v) for v in por_super.values())
+        ocultos = sum(len(v) for v in datos["por_supermercado"].values()) - n
+        if not n:
+            continue
+        with st.expander(f"🛍️ {datos.get('busqueda', 'Productos')}: {n} productos · agregá al carrito"):
+            if ocultos:
+                st.caption(f"Se ocultaron {ocultos} que no corresponden a lo que pediste.")
+            for supermercado, productos in por_super.items():
+                st.markdown(f"**{supermercado}**")
+                for prod in productos:
+                    col_nombre, col_precio, col_boton = st.columns([6, 3, 1], vertical_alignment="center")
+                    marca = f" · {prod['marca']}" if prod.get("marca") else ""
+                    estrella = "⭐ " if prod.get("marca_preferida") else ""
+                    col_nombre.markdown(f"{estrella}{prod['nombre']}<br><small>{marca.removeprefix(' · ')}</small>",
+                                        unsafe_allow_html=True)
+                    unitario = (f"<br><small>{_pesos(prod['precio_unitario'])}"
+                                f"{(prod.get('unidad_precio') or '').removeprefix('$')}</small>"
+                                if prod.get("precio_unitario") else "")
+                    col_precio.markdown(f"{_pesos(prod['precio'])}{unitario}", unsafe_allow_html=True)
+                    col_boton.button("➕", key=f"add-{indice}-{j}-{_clave_producto(supermercado, prod)}",
+                                     help="Agregar al carrito", on_click=agregar_al_carrito,
+                                     args=(supermercado, prod))
+
+
+def dibujar_carrito():
+    carrito = st.session_state.carrito
+    total = sum(i["precio"] * i["cantidad"] for i in carrito.values())
+    unidades = sum(i["cantidad"] for i in carrito.values())
+    with st.expander(f"🛒 Carrito · {unidades} · {_pesos(total)}" if carrito else "🛒 Carrito vacío",
+                     expanded=bool(carrito)):
+        if not carrito:
+            st.caption("Agregá productos con ➕ desde los resultados de una búsqueda.")
+            return
+        por_super = {}
+        for clave, item in carrito.items():
+            por_super.setdefault(item["supermercado"], []).append((clave, item))
+        for supermercado, items in por_super.items():
+            subtotal = sum(i["precio"] * i["cantidad"] for _, i in items)
+            st.markdown(f"**{supermercado}** · {_pesos(subtotal)}")
+            for clave, item in items:
+                st.markdown(f"<small>{item['nombre']}<br>{item['cantidad']} × {_pesos(item['precio'])}</small>",
+                            unsafe_allow_html=True)
+                menos, mas, _ = st.columns([1, 1, 3])
+                menos.button("−", key=f"menos-{clave}", on_click=cambiar_cantidad, args=(clave, -1))
+                mas.button("+", key=f"mas-{clave}", on_click=cambiar_cantidad, args=(clave, 1))
+        st.markdown(f"**Total: {_pesos(total)}**")
+        if len(por_super) > 1:
+            st.caption(f"Comprás en {len(por_super)} supermercados distintos.")
+        if st.button("Vaciar carrito", use_container_width=True):
+            carrito.clear()
+            st.rerun()
+
+
+# ------------------------------------------------------------------ preferencias
+
+def quitar_preferencia_ui(pref: dict):
+    if pref["alcance"] == "siempre":
+        preferencias.borrar(pref["clave"])
+    else:
+        actuales = agente.get_state(config).values.get("preferencias") or []
+        agente.update_state(config, {"preferencias": [p for p in actuales if p["clave"] != pref["clave"]]})
+
+
+def dibujar_preferencias():
+    prefs = preferencias.efectivas(agente.get_state(config).values)
+    st.markdown("**⭐ Preferencias**")
+    if not prefs:
+        st.caption("Contale al agente tus gustos (\"no me gustan las marcas propias\", "
+                   "\"prefiero La Serenísima\") y se guardan acá.")
+        return
+    for pref in prefs:
+        icono = "📌" if pref["alcance"] == "siempre" else "💬"
+        st.button(f"{icono} {preferencias.etiqueta(pref)} ✕", key=f"pref-{pref['alcance']}-{pref['clave']}",
+                  help="Guardada para siempre" if pref["alcance"] == "siempre" else "Solo en esta conversación",
+                  on_click=quitar_preferencia_ui, args=(pref,),
+                  disabled=bool(st.session_state.en_curso))  # no tocar el estado con el agente pausado
+    st.caption("📌 siempre · 💬 esta conversación · ✕ para quitar")
 
 
 # ------------------------------------------------------------------ ejecución en streaming
@@ -137,8 +275,13 @@ def pasos_de_mensaje(nodo: str, msg) -> tuple[list[dict], str | None]:
         elif msg.text.strip():
             respuesta = msg.text.strip()
     elif nodo == "tools":
-        pasos.append({"tipo": "tool_result", "nombre": msg.name,
-                      "resumen": resumir_resultado(msg.name, msg.content)})
+        paso = {"tipo": "tool_result", "nombre": msg.name, "resumen": resumir_resultado(msg.name, msg.content)}
+        if msg.name == "buscar_productos":  # los productos se guardan para poder agregarlos al carrito
+            try:
+                paso["datos"] = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
+            except ValueError:
+                pass
+        pasos.append(paso)
     return pasos, respuesta
 
 
@@ -284,6 +427,9 @@ with st.sidebar:
     if st.button("🆕 Nueva conversación", use_container_width=True):
         nueva_conversacion()
         st.rerun()
+    dibujar_carrito()
+    dibujar_preferencias()
+    st.divider()
     dibujar_historial_conversaciones()
     st.divider()
     st.caption("Compara precios en Vea, Jumbo, Carrefour, ChangoMás y Día.")
@@ -291,12 +437,12 @@ with st.sidebar:
 st.title("Asistente de compras")
 
 # historial: se redibuja completo en cada rerun, incluidos los pasos de cada turno
-for turno in st.session_state.historial:
+for i, turno in enumerate(st.session_state.historial):
     with st.chat_message(turno["rol"]):
         if turno["rol"] == "user":
             st.markdown(turno["texto"])
         else:
-            dibujar_turno_asistente(turno)
+            dibujar_turno_asistente(turno, i)
 
 # nombre del modelo junto al cuadro de chat, fijo abajo como en ChatGPT/Claude
 # (st.bottom es el contenedor donde Streamlit fija el chat_input)
