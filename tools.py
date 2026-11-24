@@ -307,6 +307,32 @@ def _formatear(prod, preferida: bool = False) -> dict:
     }
 
 
+# Rubros: filtro por la categoría que trae la API (el texto de búsqueda es difuso: "vacio" trae
+# queso "al vacío", "leña" trae calefactores). Cada súper usa su propio árbol de categorías,
+# así que cada rubro lista las variantes vistas en los 5 (verificado con búsquedas reales, nov. 2026).
+# incluir: alguna tiene que estar en la categoría; excluir_*: ninguna puede estar.
+RUBROS = {
+    "carnes": {"incluir": ["carne", "carniceria"],              # /Carnes/, /Carnicería/, /Carnes y pescados/
+               "excluir_categoria": ["carbon", "lena", "encendido"]},
+    "leña_carbon": {"incluir": ["carbon y lena", "carbon lena", "carbon y encendido", "horno y fuego"],
+                    "excluir_nombre": ["chips", "asadera"]},  # chips de ahumar: misma categoría que la leña;
+                                                              # asadera: "acero al carbono" en Horno y Fuego
+    "verduras": {"incluir": ["frutas y verduras"]},            # saca semillas (/Vivero/, /Patio y Jardín/)
+}
+Rubro = Literal["carnes", "leña_carbon", "verduras"]
+
+
+def _en_rubro(prod, rubro: str | None) -> bool:
+    if not rubro:
+        return True
+    reglas = RUBROS[rubro]
+    categoria = prefs_._normalizar(prod.categoria)
+    nombre = prefs_._normalizar(prod.nombre)
+    return (any(i in categoria for i in reglas["incluir"])
+            and not any(e in categoria for e in reglas.get("excluir_categoria", []))
+            and not any(e in nombre for e in reglas.get("excluir_nombre", [])))
+
+
 def _buscar_en(adapter, producto: str):
     """Busca en un supermercado. Devuelve (nombre, productos, error)."""
     try:
@@ -318,7 +344,7 @@ def _buscar_en(adapter, producto: str):
 @tool(parse_docstring=True)
 @_sin_romper
 def buscar_productos(producto: str, cantidad_por_super: int = 3,
-                     supermercados: list[str] | None = None,
+                     supermercados: list[str] | None = None, rubro: Rubro | None = None,
                      runtime: ToolRuntime[Contexto] = None) -> dict:
     """Busca un producto en los supermercados disponibles (todos, o solo los indicados)
     y devuelve, para cada supermercado, las opciones más convenientes ordenadas por
@@ -346,6 +372,11 @@ def buscar_productos(producto: str, cantidad_por_super: int = 3,
         supermercados: opcional, limita la búsqueda a estos supermercados. Valores
             válidos: "vea", "jumbo", "carrefour", "changomas", "dia". Si se omite,
             usa la elección del usuario o todos.
+        rubro: opcional, filtra por la categoría del supermercado y saca el ruido de la
+            búsqueda por texto. "carnes" (cortes, achuras, embutidos: "vacio" sin queso
+            ni verdura "al vacío"), "leña_carbon" (combustible para el fuego, sin
+            calefactores ni chips) o "verduras" (frutas y verduras frescas, sin semillas).
+            Pasalo siempre que el producto sea de uno de esos rubros; si no, omitilo.
     """
     cantidad = max(1, min(cantidad_por_super, MAX_POR_SUPER))
 
@@ -369,7 +400,8 @@ def buscar_productos(producto: str, cantidad_por_super: int = 3,
 
         # la API trae ruido ("yerba mate" -> tomate): se filtra antes de ordenar para que
         # no ocupe el top que ve el modelo ni quede como "mas_barato"
-        disponibles = [p for p in productos if p.disponible and _es_relevante(p.nombre, producto)]
+        disponibles = [p for p in productos if p.disponible and _es_relevante(p.nombre, producto)
+                       and _en_rubro(p, rubro)]
         # primero los que tienen precio unitario (ordenados), al final los que no
         disponibles.sort(key=lambda p: (p.precio_unitario is None, p.precio_unitario or 0))
         todos.extend(disponibles)  # a la cache van todos (las preferencias se aplican al leer)
@@ -456,11 +488,15 @@ def _palabras(texto: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", texto)
 
 
+_ENVASE_AL_VACIO = re.compile(r"\b(?:envasado|env|ev)?\s*al vacio\b|\benv vacio\b")
+
+
 def _es_relevante(nombre: str, busqueda: str) -> bool:
     """Cada palabra clave de la búsqueda tiene que estar en el nombre como palabra
     (no como pedazo: "mate" no matchea "tomate"). Tolera plurales: "galletita" ~ "galletitas"."""
     claves = [w.rstrip("s") for w in _palabras(busqueda) if w not in _IGNORAR and not w.isdigit()]
-    del_nombre = _palabras(nombre)
+    # "al vacío" describe el envase, no el producto: "Tapa de Bife Ev Al Vacio" no es el corte vacío
+    del_nombre = _palabras(_ENVASE_AL_VACIO.sub(" ", " ".join(_palabras(nombre))))
     return all(any(w.startswith(c) for w in del_nombre) for c in claves)
 
 

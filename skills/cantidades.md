@@ -15,24 +15,23 @@ Valores de referencia del grupo para un adulto. Niños: la mitad.
 4. Buscá cada producto con buscar_productos y seguí con la skill `armar_carrito`.
 
 ## Asado (por persona)
-"Buscar como" es el texto para buscar_productos, probado en los 5 supermercados (nov. 2026).
-Cada catálogo nombra distinto los cortes: "asado" trae carne en todos pero también ruido
-(cuchillos, mayonesa sabor asado): descartalo por categoría con descartar_productos.
-Si un súper no tiene un corte, no busques más variantes: usá otro corte de la lista o
-decí que ese súper no lo tiene. Evitá "carne" o "vacio" solos: traen cualquier cosa.
+"Buscar como" es el texto y el `rubro` para buscar_productos, probados en los 5 supermercados
+(nov. 2026). El rubro filtra por la categoría del súper y saca el ruido (mayonesa "sabor asado",
+queso "al vacío", calefactores a leña). Si un súper no tiene un corte, no busques más variantes:
+usá otro corte de la lista o decí que ese súper no lo tiene.
 
 | Producto | Cantidad | Buscar como |
 |---|---|---|
-| Carne: asado (tira) y vacío, mitad y mitad | 400 g; 500 g si es con hueso | "asado" y "vacio novillo" |
-| Chorizo | 1 un (≈ 120 g) | "chorizo cerdo" |
-| Morcilla | 1 un cada 2 personas (≈ 100 g c/u) | "morcilla" |
+| Carne: asado (tira) y vacío, mitad y mitad | 400 g; 500 g si es con hueso | "asado" y "vacio", rubro carnes |
+| Chorizo | 1 un (≈ 120 g) | "chorizo cerdo", rubro carnes |
+| Morcilla | 1 un cada 2 personas (≈ 100 g c/u) | "morcilla", rubro carnes |
 | Pan | 100 g | "pan frances"; si no hay, "pan" |
-| Leña (obligatoria) | 2 kg por cada kg de carne (asado para 5 ≈ 5 kg) | "leña" |
+| Leña (obligatoria) | 2 kg por cada kg de carne (asado para 5 ≈ 5 kg) | "leña", rubro leña_carbon |
 | Bebida sin alcohol | 750 ml | "gaseosa" |
 | Vino | 1 botella (0,75 L) cada 3 adultos: pasalo en L | "vino tinto" |
-| Ensalada | 1 lechuga cada 4 personas, 150 g de tomate | "lechuga", "tomate redondo" |
+| Ensalada | 1 lechuga cada 4 personas, 150 g de tomate | "lechuga", "tomate redondo", rubro verduras |
 
-- Para el fuego usá **leña** (lo tradicional). Ofrecé carbón ("carbon vegetal", 1 kg por kg
+- Para el fuego usá **leña** (lo tradicional). Ofrecé carbón ("carbon", rubro leña_carbon, 1 kg por kg
   de carne) solo si el usuario lo pide o si no hay leña en los supermercados elegidos.
 - Cortes de asado: tira de asado, vacío, matambre, entraña, colita de cuadril. No uses
   cortes de plancha o milanesa (bife, nalga, tapa de bife) aunque sean más baratos.

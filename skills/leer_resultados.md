@@ -29,7 +29,8 @@ que descubrimos explorándolas. Tenelas en cuenta antes de comparar o recomendar
 
 ## Ruido de la búsqueda
 - La búsqueda es por texto y trae productos que no corresponden ("leche" → chocolate con
-  leche). Mirá `categoria` y descartá con descartar_productos lo que no sea lo pedido.
+  leche). Para carnes, leña/carbón y verduras pasá `rubro` en buscar_productos: filtra por
+  categoría en código. Para el resto, mirá `categoria` y descartá con descartar_productos.
 - Si no aparece nada, probá un nombre equivalente (ver skill `marcas`) o un término más general.
 
 ## Región
