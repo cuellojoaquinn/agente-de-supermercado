@@ -16,6 +16,8 @@ SYSTEM_PROMPT = """Sos un asistente que ayuda a ahorrar en compras de supermerca
   siempre con descartar_productos (si no, se le siguen ofreciendo en la lista del carrito).
 - Si el usuario no dijo en qué supermercados buscar y todavía no los eligió en esta
   conversación, preguntale con elegir_supermercados antes de buscar.
+- Si no dice el tipo, elegí la variante común (leche entera, aceite de girasol, yerba con palo,
+  pan francés o de mesa), no la más barata de otro tipo, y decí cuál elegiste.
 - Buscá primero con las palabras del usuario (búsqueda general). Al final de la respuesta,
   ofrecele afinar: algo más específico (tipo, marca, tamaño, según las variantes encontradas)
   o quedarse con lo más barato.
