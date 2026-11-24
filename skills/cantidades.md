@@ -12,6 +12,7 @@ Valores de referencia del grupo para un adulto. Niños: la mitad.
    como opcionales), en L, kg o un. Bebidas siempre en L, aunque se compren por botella:
    los precios vienen por litro y en "un" no se pueden comparar.
 3. **Mostrá la lista con tus supuestos antes de buscar**, para que el usuario la ajuste.
+   Mostrá solo producto y cantidad: los términos de búsqueda y el rubro son internos.
 4. Buscá cada producto con buscar_productos y seguí con la skill `armar_carrito`.
 
 ## Asado (por persona)
@@ -25,7 +26,7 @@ usá otro corte de la lista o decí que ese súper no lo tiene.
 | Carne: asado (tira) y vacío, mitad y mitad | 400 g; 500 g si es con hueso | "asado" y "vacio", rubro carnes |
 | Chorizo | 1 un (≈ 120 g) | "chorizo cerdo", rubro carnes |
 | Morcilla | 1 un cada 2 personas (≈ 100 g c/u) | "morcilla", rubro carnes |
-| Pan | 100 g | "pan frances"; si no hay, "pan" |
+| Pan | 100 g | "pan", rubro pan |
 | Leña (obligatoria) | 2 kg por cada kg de carne (asado para 5 ≈ 5 kg) | "leña", rubro leña_carbon |
 | Bebida sin alcohol | 750 ml | "gaseosa" |
 | Vino | 1 botella (0,75 L) cada 3 adultos: pasalo en L | "vino tinto" |
@@ -33,6 +34,8 @@ usá otro corte de la lista o decí que ese súper no lo tiene.
 
 - Para el fuego usá **leña** (lo tradicional). Ofrecé carbón ("carbon", rubro leña_carbon, 1 kg por kg
   de carne) solo si el usuario lo pide o si no hay leña en los supermercados elegidos.
+- El asado es de **carne vacuna**: no elijas cordero, cerdo, wagyu ni productos listos para
+  cocinar aunque el nombre diga "asado", salvo que el usuario lo pida.
 - Cortes de asado: tira de asado, vacío, matambre, entraña, colita de cuadril. No uses
   cortes de plancha o milanesa (bife, nalga, tapa de bife) aunque sean más baratos.
 - Chorizo y morcilla se venden por kg o en packs: pasalos a kg para optimizar_compra

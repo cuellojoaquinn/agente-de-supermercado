@@ -319,8 +319,11 @@ RUBROS = {
                     "excluir_nombre": ["chips", "asadera"]},  # chips de ahumar: misma categoría que la leña;
                                                               # asadera: "acero al carbono" en Horno y Fuego
     "verduras": {"incluir": ["frutas y verduras"]},            # saca semillas (/Vivero/, /Patio y Jardín/)
+    "pan": {"incluir": ["panaderia", "panificados"],           # /Panadería/, /Almacén/Panificados/
+            "excluir_categoria": ["rallado", "rebozador", "galletas"],
+            "excluir_nombre": ["rallado"]},                     # Vea: "Pan Rallado (p)" en Galletas y Bizcochos
 }
-Rubro = Literal["carnes", "leña_carbon", "verduras"]
+Rubro = Literal["carnes", "leña_carbon", "verduras", "pan"]
 
 
 def _en_rubro(prod, rubro: str | None) -> bool:
@@ -376,7 +379,8 @@ def buscar_productos(producto: str, cantidad_por_super: int = 3,
         rubro: opcional, filtra por la categoría del supermercado y saca el ruido de la
             búsqueda por texto. "carnes" (cortes, achuras, embutidos: "vacio" sin queso
             ni verdura "al vacío"), "leña_carbon" (combustible para el fuego, sin
-            calefactores ni chips) o "verduras" (frutas y verduras frescas, sin semillas).
+            calefactores ni chips), "verduras" (frutas y verduras frescas, sin semillas)
+            o "pan" (pan de panadería y lactal, sin pan rallado).
             Pasalo siempre que el producto sea de uno de esos rubros; si no, omitilo.
     """
     cantidad = max(1, min(cantidad_por_super, MAX_POR_SUPER))

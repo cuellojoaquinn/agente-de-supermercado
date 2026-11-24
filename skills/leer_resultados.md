@@ -18,6 +18,12 @@ que descubrimos explorándolas. Tenelas en cuenta antes de comparar o recomendar
 - `con_descuento: true`: el precio ya tiene un descuento aplicado. Puede requerir
   condiciones (cantidad mínima, medio de pago) que la API no informa: avisá que puede variar.
 
+## Si el usuario no dice el tipo
+Elegí la variante común, no la más barata de otro tipo, y decí cuál elegiste:
+leche **entera**, aceite de **girasol**, yerba **con palo**, arroz **largo fino**, azúcar
+**común**, fideos **secos** (no frescos ni rellenos), pan **francés o de mesa**. Si quiere
+otra, que lo pida.
+
 ## Unidades que no se comparan
 - Solo compará productos con la misma `unidad_precio`. $/kg contra $/un no tiene sentido.
 - Papel higiénico: algunos vienen en $/m (metros), otros en $/m2 o $/un (rollos).
