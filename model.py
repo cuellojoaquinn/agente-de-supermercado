@@ -44,13 +44,13 @@ def modelos_disponibles() -> dict[str, str]:
     """Un modelo por proveedor, según el .env: {proveedor: modelo}."""
     return {
         "gemini": os.getenv("MODELO", "gemini-3.8-flash"),
-        "opencode": os.getenv("MODELO_OPENCODE", "deepseek-v4.1-flash-free"),
+        "opencode": os.getenv("MODELO_OPENCODE", "qwen3.8-flash"),
         "lmstudio": os.getenv("MODELO_LOCAL", "qwen/qwen3.5-9b"),
     }
 
 
 def proveedor_default() -> str:
-    return os.getenv("PROVEEDOR", "gemini").lower()
+    return os.getenv("PROVEEDOR", "opencode").lower()
 
 
 def get_model(proveedor: str | None = None):
