@@ -313,7 +313,8 @@ def _formatear(prod, preferida: bool = False) -> dict:
 # incluir: alguna tiene que estar en la categoría; excluir_*: ninguna puede estar.
 RUBROS = {
     "carnes": {"incluir": ["carne", "carniceria"],              # /Carnes/, /Carnicería/, /Carnes y pescados/
-               "excluir_categoria": ["carbon", "lena", "encendido"]},
+               "excluir_categoria": ["carbon", "lena", "encendido",
+                                     "listos para cocinar"]},  # "Parrillada Asado Con Pollo" no es un corte
     "leña_carbon": {"incluir": ["carbon y lena", "carbon lena", "carbon y encendido", "horno y fuego"],
                     "excluir_nombre": ["chips", "asadera"]},  # chips de ahumar: misma categoría que la leña;
                                                               # asadera: "acero al carbono" en Horno y Fuego
