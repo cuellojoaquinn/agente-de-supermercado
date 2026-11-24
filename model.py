@@ -10,7 +10,7 @@ def _modelo_gemini(modelo: str):
     return ChatGoogleGenerativeAI(
         model=modelo,
         max_retries=2,          # reintenta con backoff ante 429/5xx
-        timeout=15,             # corta en vez de quedar colgado
+        timeout=60,             # Gemini lo usa como plazo del servidor: con 8 tools + razonamiento, 15 s daba 504
         thinking_level="low",   # menos latencia por paso del agente
         include_thoughts=True,  # sin esto Gemini razona pero no devuelve el bloque 'reasoning'
     )

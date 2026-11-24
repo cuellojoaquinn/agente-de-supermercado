@@ -3,3 +3,4 @@
 __pycache__/
 checkpoints.db*
 memoria.db*
+planes/

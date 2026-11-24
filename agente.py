@@ -3,7 +3,8 @@ from langchain.agents.middleware import ModelRequest, dynamic_prompt
 import preferencias
 from model import get_model
 from langchain_google_genai.chat_models import GoogleAPIError, GoogleRateLimitError
-from tools import (Contexto, EstadoAgente, buscar_productos, descartar_productos, elegir_supermercados,
+from tools import (Contexto, EstadoAgente, buscar_productos, cargar_skill, descartar_productos, elegir_supermercados,
+                   generar_plan_compra,
                    guardar_preferencia, optimizar_carrito, optimizar_compra, quitar_preferencia)
 import sqlite3
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -15,14 +16,30 @@ SYSTEM_PROMPT = """Sos un asistente que ayuda a ahorrar en compras de supermerca
   siempre con descartar_productos (si no, se le siguen ofreciendo en la lista del carrito).
 - Si el usuario no dijo en qué supermercados buscar y todavía no los eligió en esta
   conversación, preguntale con elegir_supermercados antes de buscar.
+- Si no dice el tipo, elegí la variante común (leche entera, aceite de girasol, yerba con palo,
+  pan francés o de mesa), no la más barata de otro tipo, y decí cuál elegiste.
 - Buscá primero con las palabras del usuario (búsqueda general). Al final de la respuesta,
   ofrecele afinar: algo más específico (tipo, marca, tamaño, según las variantes encontradas)
   o quedarse con lo más barato.
+- Si pide precios o el total de una compra de varios productos, buscá cada uno y calculá
+  con optimizar_compra: no sumes ni multipliques precios vos. Vale también para la lista que
+  armaste con la skill cantidades: si el usuario pide "los precios" o "cuánto sale", buscá
+  y llamá a optimizar_compra; no calcules costos de una cantidad (ej: 5 kg de una bolsa de 10 kg).
+- Después de optimizar_compra, ofrecé el plan de compra en un archivo. Si el usuario confirma
+  la opción o lo pide, generalo con generar_plan_compra (mismos items y supermercados).
+  Si armó el carrito a mano y pide el plan, usá opcion="carrito": tiene que coincidir con su carrito.
 - Si pide optimizar o revisar su carrito, usá optimizar_carrito. Si una compra reparte
   en varios supermercados por poco ahorro, decíselo y proponé ir a menos.
+- Tenés skills con conocimiento del dominio (cargar_skill). Cargá la que corresponda
+  antes de actuar: armar_carrito para optimizar compras, marcas para comparar marcas o
+  armar una versión económica, cantidades si pide algo general ("asado para 10") en vez
+  de una lista, leer_resultados antes de comparar precios. Cada una, una vez por conversación.
 - Cuando exprese gustos o restricciones (marcas, marcas propias, otras condiciones),
   guardalos con guardar_preferencia y respetalos.
-- Respondé en español, con montos en pesos."""
+- Respondé en español, con montos en pesos ($1.890). Usá markdown simple: nada de
+  LaTeX ni fórmulas (\\rightarrow, $$...$$); para flechas usá →. No escribas links ni
+  URLs que no te haya dado una herramienta: el plan se descarga con el botón que muestra la
+  pantalla debajo de tu respuesta."""
 
 # Nos pide poder mostrar una memoria corto plazo. Corto plazo: solamente consultar mensajes de esta conversacion.
 # El problema: es que no persisto y no las puedo retomar. checkpoint con sql lite.
@@ -47,7 +64,8 @@ def crear_agente(proveedor: str | None = None):
     return create_agent(
         model=get_model(proveedor),
         tools=[elegir_supermercados, buscar_productos, descartar_productos, optimizar_compra,
-               optimizar_carrito, guardar_preferencia, quitar_preferencia],
+               optimizar_carrito, guardar_preferencia, quitar_preferencia, cargar_skill,
+               generar_plan_compra],
         middleware=[prompt_con_preferencias],  # system prompt + preferencias vigentes
         checkpointer=checkpointer,
         state_schema=EstadoAgente,  # guarda supermercados y preferencias junto a los mensajes

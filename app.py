@@ -15,6 +15,7 @@ Correr con:  streamlit run app.py
 import json
 import unicodedata
 import uuid
+from pathlib import Path
 from datetime import date, datetime
 
 import streamlit as st
@@ -63,8 +64,22 @@ def _pesos(x) -> str:
     return f"${texto.removesuffix(',00')}"
 
 
+def md(texto: str) -> str:
+    """Escapa los $ para st.markdown: dos $ en una línea ("$1.890 ... $5.999") los toma
+    como una fórmula LaTeX y rompe el texto."""
+    return texto.replace("$", r"\$")
+
+
 def resumir_resultado(nombre: str, contenido) -> str:
     """Una línea legible en lugar del JSON completo que recibe el modelo."""
+    if nombre == "cargar_skill":  # devuelve markdown, no JSON
+        texto = str(contenido)
+        if texto.startswith("Error"):
+            return f"⚠️ {texto}"
+        lineas = texto.splitlines()
+        nombre_skill = lineas[0].removeprefix("Skill:").strip() if lineas else "?"
+        titulo = next((l.lstrip("# ") for l in lineas if l.startswith("#")), "")
+        return f"📘 skill cargada: **{nombre_skill}**" + (f" · {titulo}" if titulo else "")
     try:
         datos = contenido if isinstance(contenido, dict) else json.loads(contenido)
     except (TypeError, ValueError):
@@ -97,6 +112,11 @@ def resumir_resultado(nombre: str, contenido) -> str:
             partes.append(f"⚠️ sin buscar antes: {', '.join(datos['sin_buscar'])}")
         return " · ".join(partes) or "sin resultados"
 
+    if nombre == "generar_plan_compra":
+        if datos.get("error"):
+            return f"⚠️ {datos['error']}"
+        return f"📄 plan generado: **{datos.get('titulo')}** · total {_pesos(datos.get('total') or 0)}"
+
     if nombre == "optimizar_carrito":
         if datos.get("error"):
             return f"⚠️ {datos['error']}"
@@ -116,14 +136,14 @@ def dibujar_paso(paso: dict):
     tipo = paso["tipo"]
     if tipo == "razonamiento":
         with st.expander("🧠 Razonamiento del modelo"):
-            st.markdown(paso["texto"])
+            st.markdown(md(paso["texto"]))
     elif tipo == "nota":  # texto que el modelo escribe junto con las tool calls
-        st.caption(f"💬 {paso['texto']}")
+        st.caption(md(f"💬 {paso['texto']}"))
     elif tipo == "tool_call":
         args = ", ".join(f"{k}={v!r}" for k, v in paso["args"].items())
         st.markdown(f"🔧 **{paso['nombre']}**(`{args}`)")
     elif tipo == "tool_result":
-        st.markdown(f"✅ `{paso['nombre']}` → {paso['resumen']}")
+        st.markdown(md(f"✅ `{paso['nombre']}` → {paso['resumen']}"))
 
 
 def dibujar_turno_asistente(turno: dict, indice: int | None = None):
@@ -136,9 +156,23 @@ def dibujar_turno_asistente(turno: dict, indice: int | None = None):
     if turno.get("error"):
         st.error(turno["error"])
     if turno.get("respuesta"):
-        st.markdown(turno["respuesta"])
+        st.markdown(md(turno["respuesta"]))
     if indice is not None:
+        dibujar_planes(turno, indice)
         dibujar_productos(turno, indice)
+
+
+def dibujar_planes(turno: dict, indice: int):
+    """Botón de descarga por cada plan que generó el agente en este turno (resultado tangible)."""
+    for i, paso in enumerate(p for p in turno["pasos"] if p.get("archivo")):
+        archivo = Path(paso["archivo"])
+        if not archivo.exists():  # se borró la carpeta planes/: la conversación sigue igual
+            st.caption(f"📄 {archivo.name} (el archivo ya no está en disco)")
+            continue
+        with st.expander(f"📄 {archivo.name}", expanded=True):
+            st.markdown(md(archivo.read_text(encoding="utf-8")))
+            st.download_button("⬇️ Descargar plan (.md)", archivo.read_bytes(), file_name=archivo.name,
+                               mime="text/markdown", key=f"plan-{indice}-{i}")
 
 
 # ------------------------------------------------------------------ carrito (estado local)
@@ -210,7 +244,7 @@ def dibujar_productos(turno: dict, indice: int):
                     unitario = (f"<br><small>{_pesos(prod['precio_unitario'])}"
                                 f"{(prod.get('unidad_precio') or '').removeprefix('$')}</small>"
                                 if prod.get("precio_unitario") else "")
-                    col_precio.markdown(f"{_pesos(prod['precio'])}{unitario}", unsafe_allow_html=True)
+                    col_precio.markdown(md(f"{_pesos(prod['precio'])}{unitario}"), unsafe_allow_html=True)
                     col_boton.button("➕", key=f"add-{indice}-{j}-{_clave_producto(supermercado, prod)}",
                                      help="Agregar al carrito", on_click=agregar_al_carrito,
                                      args=(supermercado, prod, datos.get("busqueda")))
@@ -291,7 +325,15 @@ def pasos_de_mensaje(nodo: str, msg) -> tuple[list[dict], str | None]:
         elif msg.text.strip():
             respuesta = msg.text.strip()
     elif nodo == "tools":
-        paso = {"tipo": "tool_result", "nombre": msg.name, "resumen": resumir_resultado(msg.name, msg.content)}
+        paso = {"tipo": "tool_result", "nombre": msg.name, "id": msg.tool_call_id,
+                "resumen": resumir_resultado(msg.name, msg.content)}
+        if msg.name == "generar_plan_compra":  # la ruta del archivo, para el botón de descarga
+            try:
+                datos = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
+                if datos.get("archivo"):
+                    paso["archivo"] = datos["archivo"]
+            except (ValueError, AttributeError):
+                pass
         if msg.name == "buscar_productos":  # los productos se guardan para poder agregarlos al carrito
             try:
                 paso["datos"] = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
@@ -319,6 +361,10 @@ def ejecutar(entrada, turno: dict | None = None) -> dict:
                     for update in data if isinstance(data, list) else [data]:
                         for msg in (update or {}).get("messages", []):
                             pasos, respuesta = pasos_de_mensaje(nodo, msg)
+                            # al reanudar tras un interrupt, LangGraph vuelve a emitir el resultado de
+                            # las tools que ya habían terminado en ese paso: no se dibujan dos veces
+                            vistos = {p.get("id") for p in turno["pasos"] if p.get("id")}
+                            pasos = [p for p in pasos if not p.get("id") or p["id"] not in vistos]
                             for paso in pasos:
                                 dibujar_paso(paso)  # se ve apenas termina cada paso
                                 if paso["tipo"] == "tool_call":
@@ -340,7 +386,7 @@ def ejecutar(entrada, turno: dict | None = None) -> dict:
     if turno["error"]:
         st.error(turno["error"])
     if turno["respuesta"]:
-        st.markdown(turno["respuesta"])
+        st.markdown(md(turno["respuesta"]))
     return turno
 
 
@@ -458,7 +504,7 @@ st.title("Asistente de compras")
 for i, turno in enumerate(st.session_state.historial):
     with st.chat_message(turno["rol"]):
         if turno["rol"] == "user":
-            st.markdown(turno["texto"])
+            st.markdown(md(turno["texto"]))
         else:
             dibujar_turno_asistente(turno, i)
 
