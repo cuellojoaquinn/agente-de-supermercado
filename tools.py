@@ -1,3 +1,4 @@
+import functools
 import math
 import re
 import unicodedata
@@ -11,6 +12,7 @@ from typing import Annotated, Literal, NotRequired
 from langchain.agents import AgentState
 from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
+from langgraph.errors import GraphBubbleUp
 from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 import preferencias as prefs_
@@ -113,6 +115,24 @@ def _nombres(claves) -> str:
     return ", ".join(SUPERMERCADOS[s].nombre for s in claves)
 
 
+
+def _sin_romper(fn):
+    """Una excepción dentro de una tool vuelve al modelo como {"error": ...} en vez de cortar
+    el flujo del agente (consigna 3.2). Los interrupt de LangGraph (GraphBubbleUp) también son
+    excepciones: esos se dejan pasar, porque así se pausa el agente para preguntarle al usuario."""
+    @functools.wraps(fn)
+    def envoltura(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except GraphBubbleUp:
+            raise
+        except Exception as e:
+            print(f"[{fn.__name__}] error: {type(e).__name__}: {e}")  # para depurar en la consola
+            return {"error": f"Falló {fn.__name__}: {type(e).__name__}: {str(e)[:150]}. "
+                             f"Avisale al usuario o probá de otra forma; no inventes el resultado."}
+    return envoltura
+
+
 # ---------------------------------------------------------------- skills
 
 # Conocimiento de dominio en markdown (skills/*.md), que el agente carga solo cuando lo
@@ -185,6 +205,7 @@ def elegir_supermercados(runtime: ToolRuntime[Contexto]) -> Command:
 # ---------------------------------------------------------------- preferencias
 
 @tool(parse_docstring=True)
+@_sin_romper
 def guardar_preferencia(tipo: TipoPreferencia, valor: str | None = None,
                         alcance: str = "conversacion", runtime: ToolRuntime[Contexto] = None) -> Command:
     """Guarda una preferencia del usuario para que las búsquedas la respeten.
@@ -221,6 +242,7 @@ def guardar_preferencia(tipo: TipoPreferencia, valor: str | None = None,
 
 
 @tool(parse_docstring=True)
+@_sin_romper
 def quitar_preferencia(tipo: TipoPreferencia, valor: str | None = None,
                        runtime: ToolRuntime[Contexto] = None) -> Command:
     """Quita una preferencia (de esta conversación y de las guardadas para siempre),
@@ -245,6 +267,7 @@ class ProductoDescartado(BaseModel):
 
 
 @tool(parse_docstring=True)
+@_sin_romper
 def descartar_productos(busqueda: str, productos: list[ProductoDescartado], motivo: str,
                         runtime: ToolRuntime[Contexto] = None) -> Command:
     """Registra los resultados de una búsqueda que no corresponden a lo que pidió el
@@ -293,6 +316,7 @@ def _buscar_en(adapter, producto: str):
 
 
 @tool(parse_docstring=True)
+@_sin_romper
 def buscar_productos(producto: str, cantidad_por_super: int = 3,
                      supermercados: list[str] | None = None,
                      runtime: ToolRuntime[Contexto] = None) -> dict:
@@ -496,6 +520,7 @@ def _por_cantidad_de_supermercados(opciones: dict[str, dict[str, dict]]) -> list
 
 
 @tool(parse_docstring=True)
+@_sin_romper
 def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = None,
                      max_supermercados: int | None = None, runtime: ToolRuntime[Contexto] = None) -> dict:
     """Calcula la forma más barata de comprar una lista completa, usando los precios
@@ -647,6 +672,7 @@ def _opcion(prod, cantidad_base: float) -> dict | None:
 
 
 @tool(parse_docstring=True)
+@_sin_romper
 def optimizar_carrito(max_supermercados: int | None = None, runtime: ToolRuntime[Contexto] = None) -> dict:
     """Revisa el carrito del usuario y dice qué conviene cambiar para pagar menos por
     lo mismo: el mismo producto en otro supermercado, o la misma marca en otra
