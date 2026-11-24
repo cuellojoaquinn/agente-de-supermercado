@@ -18,12 +18,14 @@ python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-cp .env.example .env               # completar GOOGLE_API_KEY
+cp .env.example .env               # completar OPENCODE_API_KEY
 streamlit run app.py               # abre http://localhost:8501
 ```
 
-La API key de Gemini es gratis en [Google AI Studio](https://aistudio.google.com/apikey).
-`.env.example` también explica cómo usar OpenCode o LM Studio (`PROVEEDOR`).
+Usamos **qwen3.8-flash** por [OpenCode Zen](https://opencode.ai) (por API hace falta OpenCode Go).
+Elegimos este modelo porque soporta tool calling, devuelve su razonamiento (se muestra en la UI) y
+tiene 1M de tokens de contexto. Con `PROVEEDOR` en el `.env` se puede usar Gemini (key gratis en
+[Google AI Studio](https://aistudio.google.com/apikey)) o un modelo local con LM Studio.
 
 > En Ubuntu, si `python3 -m venv` falla, instalá `python3.12-venv`.
 
@@ -32,7 +34,7 @@ La API key de Gemini es gratis en [Google AI Studio](https://aistudio.google.com
 ```mermaid
 flowchart LR
     U[Usuario] --> UI[Streamlit] --> A[Agente<br>create_agent]
-    A <--> LLM[Gemini]
+    A <--> LLM[Qwen 3.8 Flash<br>OpenCode Zen]
     A --> T[Tools] --> V[APIs VTEX de los 5 súper]
     T --> S[skills/*.md]
     T --> P[planes/*.md]
@@ -55,10 +57,10 @@ flowchart LR
 
 ## Limitaciones
 
-- **Cuota gratuita de Gemini**: ~20 pedidos por día por modelo; una tarea usa entre 6 y 10. En
-  horas pico los modelos se saturan (503).
+- **Límites del proveedor**: una tarea usa entre 6 y 10 llamadas al modelo y el proveedor tiene
+  límites de uso (429). Ante 429/5xx se reintenta con espera; si se agotan, la UI lo avisa.
 - **Precios de la tienda online**: Vea devuelve precios de una sucursal de Córdoba; pueden diferir
   de la góndola.
 - **Búsqueda por texto**: los catálogos traen ruido y nombran distinto los productos. Lo mitigan el
   filtro por rubro y el modelo, pero no es perfecto.
-- **Modelos chicos** (`flash-lite`) siguen peor las reglas de las skills.
+- **Modelos chicos** (ej: `gemini-3.5-flash-lite`) siguen peor las reglas de las skills.
