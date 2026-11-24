@@ -4,9 +4,10 @@ import unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from itertools import combinations
 from pathlib import Path
-from typing import Annotated, NotRequired
+from typing import Annotated, Literal, NotRequired
 from langchain.agents import AgentState
 from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
@@ -17,6 +18,7 @@ from cache import guardar_busqueda, obtener_busqueda
 from preferencias import TipoPreferencia
 from supermercados import SUPERMERCADOS
 
+ENVASES_SOSPECHOSOS = 5     # optimizar_compra: desde cuántos envases avisa que revise el producto
 RESULTADOS_POR_SUPER = 20   # cuántos traemos de cada API para después ordenar nosotros
 MAX_POR_SUPER = 5           # tope de lo que devolvemos por súper (cuidado del contexto)
 ETIQUETA_UNIDAD = {"ml": "$/L", "g": "$/kg", "un": "$/un", "m": "$/m", "m2": "$/m2"}
@@ -447,7 +449,7 @@ def _mejor_opcion(productos, unidad_base: str, cantidad_base: float, busqueda: s
             continue
         costo = _costo(p, cantidad_base)
         if costo and (mejor is None or costo[0] < mejor["subtotal"]):
-            mejor = {"supermercado": p.supermercado, "nombre": p.nombre,
+            mejor = {"supermercado": p.supermercado, "nombre": p.nombre, "categoria": p.categoria,
                      "envases": costo[1], "subtotal": costo[0]}
     return mejor
 
@@ -505,8 +507,10 @@ def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = 
     dice cuándo conviene ir a un supermercado más y cómo presentar el resultado.
 
     Llamá a buscar_productos para cada ítem y pasá acá exactamente
-    el mismo texto de búsqueda. Revisá los nombres elegidos: si alguno no corresponde
-    a lo pedido, repetí la búsqueda con un término más específico.
+    el mismo texto de búsqueda. Revisá el nombre y la categoría de cada producto elegido
+    (y siempre los de `revisar`): si alguno no corresponde a lo pedido (ej: mayonesa
+    "sabor asado" para "asado"), descartalo con descartar_productos y volvé a llamar a
+    optimizar_compra. No informes un total que incluya productos que no corresponden.
 
     La compra mixta puede repartir la compra en muchos supermercados por poco ahorro:
     `por_cantidad_de_supermercados` dice cuánto sale yendo a 1, 2, 3... súper; usalo para
@@ -597,6 +601,16 @@ def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = 
                          "envases": o["envases"], "subtotal": _r(o["subtotal"])}
                         for b, o in plan["elegidas"].items()],
         }
+    # muchos envases chicos para cubrir lo pedido suele ser un producto que no corresponde
+    # (real: "asado 2 kg" -> 8 mayonesas "Sabor Asado" de 250 g, porque el nombre dice "asado")
+    sospechosos = [{"busqueda": d["busqueda"], "nombre": d["nombre"], "categoria": d.get("categoria"),
+                    "envases": d["envases"]}
+                   for d in mixta if d.get("envases", 0) >= ENVASES_SOSPECHOSOS]
+    if sospechosos:
+        respuesta["revisar"] = sospechosos
+        respuesta["aviso"] = ("Estos productos necesitan muchos envases: revisá nombre y categoría. Si no "
+                              "corresponden a lo pedido, descartalos con descartar_productos y volvé a "
+                              "llamar a optimizar_compra antes de responder o de generar el plan.")
     if sin_buscar:
         respuesta["sin_buscar"] = sin_buscar
         respuesta["sugerencia"] = "Llamá primero a buscar_productos con estos textos exactos."
@@ -740,3 +754,171 @@ def optimizar_carrito(max_supermercados: int | None = None, runtime: ToolRuntime
     if sin_datos:
         respuesta["sin_datos"] = sin_datos
     return respuesta
+
+
+# ---------------------------------------------------------------- generar_plan_compra
+
+PLANES_DIR = Path(__file__).parent / "planes"
+_OPCIONES_PLAN = {"mixta": "compra_mixta", "un_solo_super": "mejor_un_solo_super",
+                  "con_max_supermercados": "mejor_con_max_supermercados"}
+_TITULO_OPCION = {"mixta": "Compra mixta (cada producto donde está más barato)",
+                  "un_solo_super": "Todo en un solo supermercado",
+                  "con_max_supermercados": "Con máximo {n} supermercados"}
+
+
+def _pesos(x) -> str:
+    """12345.5 -> '$12.345,50' (formato argentino)."""
+    texto = f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"${texto.removesuffix(',00')}"
+
+
+def _envases(x: float) -> str:
+    """2 -> '2'; 0.6 -> '0,6 kg' (venta por peso: optimizar_compra devuelve los kg)."""
+    return f"{x:g}" if float(x).is_integer() else f"{x:g} kg".replace(".", ",")
+
+
+def _renderizar_carrito(titulo: str, carrito: list[dict], notas: str | None) -> tuple[str, float]:
+    """Plan con exactamente lo que el usuario puso en el carrito (mismos precios que la UI)."""
+    por_super: dict[str, list[dict]] = {}
+    for item in carrito:
+        por_super.setdefault(item["supermercado"], []).append(item)
+    total = sum(i["precio"] * i["cantidad"] for i in carrito)
+    lineas = [f"# {titulo}", "",
+              f"_Generado el {datetime.now():%d/%m/%Y %H:%M} · precios online de cada supermercado, "
+              f"pueden variar en góndola._", "",
+              "**Opción elegida:** Mi carrito (productos elegidos por el usuario)  ",
+              f"**Total: {_pesos(total)}**", ""]
+    for super_, filas in por_super.items():
+        lineas += [f"## {super_} · {_pesos(sum(f['precio'] * f['cantidad'] for f in filas))}", "",
+                   "| Producto | Cantidad | Precio | Subtotal |", "|---|---|---|---|"]
+        lineas += [f"| {f['nombre']} | {f['cantidad']} | {_pesos(f['precio'])} | "
+                   f"{_pesos(f['precio'] * f['cantidad'])} |" for f in filas]
+        lineas.append("")
+    if notas:
+        lineas += ["## Notas", "", notas.strip(), ""]
+    return "\n".join(lineas), total
+
+
+def _slug(texto: str) -> str:
+    return prefs_._normalizar(texto).replace(" ", "-")[:40] or "plan"
+
+
+def _renderizar_plan(titulo: str, opcion: str, resultado: dict, items: list[ItemCompra],
+                     notas: str | None) -> tuple[str, float]:
+    """Arma el markdown del plan a partir del resultado de optimizar_compra. Devuelve (texto, total)."""
+    elegida = resultado[_OPCIONES_PLAN[opcion]]
+    detalle = elegida["detalle"]
+    if opcion == "un_solo_super":  # su detalle no repite el súper
+        detalle = [{**d, "supermercado": elegida["supermercado"]} for d in detalle]
+    pedido = {i.busqueda: f"{i.cantidad:g} {i.unidad}".replace(".", ",") for i in items}
+
+    lineas = [f"# {titulo}", "",
+              f"_Generado el {datetime.now():%d/%m/%Y %H:%M} · precios online de cada supermercado, "
+              f"pueden variar en góndola._", "",
+              f"**Opción elegida:** {_TITULO_OPCION[opcion].format(n=elegida.get('max_supermercados'))}  ",
+              f"**Total: {_pesos(elegida['total'])}**", ""]
+
+    por_super: dict[str, list[dict]] = {}
+    for d in detalle:
+        if "supermercado" in d:
+            por_super.setdefault(d["supermercado"], []).append(d)
+    for super_, filas in por_super.items():
+        lineas += [f"## {super_} · {_pesos(sum(f['subtotal'] for f in filas))}", "",
+                   "| Pedido | Producto | Envases | Subtotal |", "|---|---|---|---|"]
+        lineas += [f"| {f['busqueda']} ({pedido.get(f['busqueda'], '')}) | {f['nombre']} | "
+                   f"{_envases(f['envases'])} | {_pesos(f['subtotal'])} |" for f in filas]
+        lineas.append("")
+
+    no_encontrados = [d["busqueda"] for d in detalle if "supermercado" not in d]
+    no_encontrados += resultado.get("sin_buscar", []) + resultado.get("unidad_invalida", [])
+    if no_encontrados:
+        lineas += ["## No incluidos", "", *[f"- {b}" for b in no_encontrados], ""]
+
+    # comparación con las demás opciones, para que el plan muestre el ahorro
+    otras = [(nombre, resultado[clave]["total"]) for nombre, clave in _OPCIONES_PLAN.items()
+             if nombre != opcion and clave in resultado]
+    if otras:
+        lineas += ["## Comparación", "", "| Opción | Total | Diferencia |", "|---|---|---|"]
+        lineas.append(f"| **{_TITULO_OPCION[opcion].format(n=elegida.get('max_supermercados'))}** | "
+                      f"**{_pesos(elegida['total'])}** | — |")
+        for nombre, total in otras:
+            n = resultado.get("mejor_con_max_supermercados", {}).get("max_supermercados")
+            lineas.append(f"| {_TITULO_OPCION[nombre].format(n=n)} | {_pesos(total)} | "
+                          f"{'+' if total >= elegida['total'] else '−'}{_pesos(abs(total - elegida['total']))} |")
+        lineas.append("")
+
+    if notas:
+        lineas += ["## Notas", "", notas.strip(), ""]
+    return "\n".join(lineas), elegida["total"]
+
+
+@tool(parse_docstring=True)
+def generar_plan_compra(titulo: str, items: list[ItemCompra] | None = None,
+                        opcion: Literal["mixta", "un_solo_super", "con_max_supermercados", "carrito"] = "mixta",
+                        supermercados: list[str] | None = None, max_supermercados: int | None = None,
+                        notas: str | None = None, runtime: ToolRuntime[Contexto] = None) -> dict:
+    """Genera el plan de compra final como archivo markdown descargable: qué comprar en
+    cada supermercado, envases, subtotales, total y comparación con las otras opciones.
+
+    Usala al cerrar una compra: cuando el usuario confirma la opción que le recomendaste
+    o pide el plan, la lista o el archivo. Pasá los mismos items, supermercados y
+    max_supermercados que en optimizar_compra: los precios se recalculan acá (no los
+    escribas vos). La UI muestra un botón para descargarlo debajo de tu respuesta: no
+    escribas un link ni repitas el plan entero; resumilo en una o dos líneas y decí que
+    lo descargue con el botón.
+
+    Si el usuario armó o editó el carrito y pide el plan "de lo que armé" / "del carrito",
+    usá opcion="carrito" (sin items): el plan sale exactamente del carrito, con sus
+    productos, cantidades y precios, y el total coincide con el que ve en pantalla.
+
+    Args:
+        titulo: título del plan, ej: "Asado para 5 personas".
+        items: los mismos productos que en optimizar_compra (busqueda, cantidad, unidad).
+            No hace falta con opcion="carrito".
+        opcion: "mixta" (cada producto donde está más barato), "un_solo_super",
+            "con_max_supermercados" (requiere max_supermercados) o "carrito" (lo que
+            el usuario puso en el carrito).
+        supermercados: opcional, los mismos que en optimizar_compra.
+        max_supermercados: opcional, el mismo límite que en optimizar_compra.
+        notas: opcional, supuestos y avisos para el usuario (cantidades asumidas,
+            sustitutos, sobrantes). Sin precios.
+    """
+    try:
+        if opcion == "carrito":
+            carrito = getattr(getattr(runtime, "context", None), "carrito", None) or []
+            if not carrito:
+                return {"error": "El carrito está vacío. El usuario agrega productos con ➕ desde los "
+                                 "resultados, o generá el plan con items y otra opción."}
+            texto, total = _renderizar_carrito(titulo, carrito, notas)
+            return _guardar_plan(titulo, opcion, texto, total)
+        if not items:
+            return {"error": "Faltan los items (los mismos que en optimizar_compra), o usá opcion='carrito'."}
+        items = [i if isinstance(i, ItemCompra) else ItemCompra(**i) for i in items]
+        resultado = optimizar_compra.func(items=items, supermercados=supermercados,
+                                          max_supermercados=max_supermercados, runtime=runtime)
+        if "error" in resultado:
+            return resultado
+        if resultado.get("sin_buscar"):
+            return {"error": f"Faltan buscar: {resultado['sin_buscar']}. Llamá antes a "
+                             f"buscar_productos con esos textos exactos."}
+        if _OPCIONES_PLAN[opcion] not in resultado:
+            disponibles = [n for n, c in _OPCIONES_PLAN.items() if c in resultado]
+            return {"error": f"La opción '{opcion}' no está disponible para esta compra "
+                             f"(ej: ningún súper tiene todo, o falta max_supermercados). "
+                             f"Disponibles: {disponibles}."}
+
+        texto, total = _renderizar_plan(titulo, opcion, resultado, items, notas)
+        return _guardar_plan(titulo, opcion, texto, total)
+    except Exception as e:  # el error vuelve al modelo como dato: el flujo del agente sigue
+        return {"error": f"No se pudo generar el plan: {type(e).__name__}: {str(e)[:150]}"}
+
+
+def _guardar_plan(titulo: str, opcion: str, texto: str, total: float) -> dict:
+    """Escribe el plan en planes/ y devuelve lo mínimo para el modelo (la UI lee el archivo)."""
+    PLANES_DIR.mkdir(exist_ok=True)
+    archivo = PLANES_DIR / f"{datetime.now():%Y%m%d-%H%M%S}-{_slug(titulo)}-{opcion}.md"
+    n = 2
+    while archivo.exists():  # mismo título y opción en el mismo segundo: no se pisa
+        archivo = archivo.with_stem(f"{archivo.stem.rsplit('_', 1)[0]}_{n}"); n += 1
+    archivo.write_text(texto, encoding="utf-8")
+    return {"archivo": str(archivo), "titulo": titulo, "opcion": opcion, "total": _r(total)}

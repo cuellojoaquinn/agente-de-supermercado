@@ -27,5 +27,9 @@ Ir a otro supermercado tiene un costo (tiempo, viaje, envío) que los precios no
 3. Ahorro frente a la alternativa (un solo súper o compra mixta).
 4. Avisos: sustitutos usados, productos no encontrados, sobrantes grandes.
 
-Ofrecé al final la versión económica (segundas marcas o marcas propias) si no la pidió;
+Al final, ofrecé descargar el plan. Cuando el usuario elige una opción (o dice "dale"),
+generalo con generar_plan_compra: `opcion` es la que eligió (mixta, un_solo_super o
+con_max_supermercados) y en `notas` van los supuestos y avisos del punto 4.
+
+Ofrecé también la versión económica (segundas marcas o marcas propias) si no la pidió;
 para eso cargá la skill `marcas`.

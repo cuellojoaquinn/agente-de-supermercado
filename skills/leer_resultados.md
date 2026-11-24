@@ -11,6 +11,8 @@ que descubrimos explorándolas. Tenelas en cuenta antes de comparar o recomendar
   carne, verdura) es el **precio por kilo**; el total depende de cuánto se pese.
 - `precio_unitario` + `unidad_precio` ($/L, $/kg, $/un): lo que se compara entre productos.
   Compará siempre por este, no por `precio`.
+- **No prorratees**: los envases se compran enteros. 5 kg de leña en bolsas de 10 kg cuestan
+  una bolsa entera, no la mitad. El costo de una cantidad lo calcula optimizar_compra.
 - Si `precio_unitario` es `null`, no se pudo leer la presentación: no lo compares con
   los demás; mostralo aparte ("no pude calcular el precio por litro").
 - `con_descuento: true`: el precio ya tiene un descuento aplicado. Puede requerir

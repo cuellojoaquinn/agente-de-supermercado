@@ -15,6 +15,7 @@ Correr con:  streamlit run app.py
 import json
 import unicodedata
 import uuid
+from pathlib import Path
 from datetime import date, datetime
 
 import streamlit as st
@@ -111,6 +112,11 @@ def resumir_resultado(nombre: str, contenido) -> str:
             partes.append(f"⚠️ sin buscar antes: {', '.join(datos['sin_buscar'])}")
         return " · ".join(partes) or "sin resultados"
 
+    if nombre == "generar_plan_compra":
+        if datos.get("error"):
+            return f"⚠️ {datos['error']}"
+        return f"📄 plan generado: **{datos.get('titulo')}** · total {_pesos(datos.get('total') or 0)}"
+
     if nombre == "optimizar_carrito":
         if datos.get("error"):
             return f"⚠️ {datos['error']}"
@@ -152,7 +158,21 @@ def dibujar_turno_asistente(turno: dict, indice: int | None = None):
     if turno.get("respuesta"):
         st.markdown(md(turno["respuesta"]))
     if indice is not None:
+        dibujar_planes(turno, indice)
         dibujar_productos(turno, indice)
+
+
+def dibujar_planes(turno: dict, indice: int):
+    """Botón de descarga por cada plan que generó el agente en este turno (resultado tangible)."""
+    for i, paso in enumerate(p for p in turno["pasos"] if p.get("archivo")):
+        archivo = Path(paso["archivo"])
+        if not archivo.exists():  # se borró la carpeta planes/: la conversación sigue igual
+            st.caption(f"📄 {archivo.name} (el archivo ya no está en disco)")
+            continue
+        with st.expander(f"📄 {archivo.name}", expanded=True):
+            st.markdown(md(archivo.read_text(encoding="utf-8")))
+            st.download_button("⬇️ Descargar plan (.md)", archivo.read_bytes(), file_name=archivo.name,
+                               mime="text/markdown", key=f"plan-{indice}-{i}")
 
 
 # ------------------------------------------------------------------ carrito (estado local)
@@ -307,6 +327,13 @@ def pasos_de_mensaje(nodo: str, msg) -> tuple[list[dict], str | None]:
     elif nodo == "tools":
         paso = {"tipo": "tool_result", "nombre": msg.name, "id": msg.tool_call_id,
                 "resumen": resumir_resultado(msg.name, msg.content)}
+        if msg.name == "generar_plan_compra":  # la ruta del archivo, para el botón de descarga
+            try:
+                datos = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
+                if datos.get("archivo"):
+                    paso["archivo"] = datos["archivo"]
+            except (ValueError, AttributeError):
+                pass
         if msg.name == "buscar_productos":  # los productos se guardan para poder agregarlos al carrito
             try:
                 paso["datos"] = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
