@@ -5,6 +5,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from itertools import combinations
+from pathlib import Path
 from typing import Annotated, NotRequired
 from langchain.agents import AgentState
 from langchain.messages import ToolMessage
@@ -108,6 +109,51 @@ def clave_producto(supermercado: str, sku_id: str) -> str:
 
 def _nombres(claves) -> str:
     return ", ".join(SUPERMERCADOS[s].nombre for s in claves)
+
+
+# ---------------------------------------------------------------- skills
+
+# Conocimiento de dominio en markdown (skills/*.md), que el agente carga solo cuando lo
+# necesita: así no ocupa contexto en cada llamada, como pasaría si fuera en el system prompt.
+SKILLS_DIR = Path(__file__).parent / "skills"
+
+
+def _separar_frontmatter(texto: str) -> tuple[dict[str, str], str]:
+    """'---\\nclave: valor\\n---\\ncuerpo' -> ({clave: valor}, cuerpo)."""
+    if not texto.startswith("---"):
+        return {}, texto
+    _, cabecera, cuerpo = texto.split("---", 2)
+    datos = dict(linea.split(":", 1) for linea in cabecera.strip().splitlines() if ":" in linea)
+    return {k.strip(): v.strip() for k, v in datos.items()}, cuerpo.strip()
+
+
+def skills_disponibles() -> dict[str, str]:
+    """{nombre: descripción} de cada skills/*.md."""
+    return {ruta.stem: _separar_frontmatter(ruta.read_text(encoding="utf-8"))[0].get("descripcion", "")
+            for ruta in sorted(SKILLS_DIR.glob("*.md"))}
+
+
+# La descripción de la tool lista las skills: el modelo sabe qué hay sin cargarlas.
+# Se arma al importar, así agregar una skill es solo agregar un .md.
+_DESCRIPCION_CARGAR_SKILL = (
+    "Carga una skill: instrucciones y conocimiento de dominio (reglas, tablas de marcas, "
+    "cantidades) que no están en el system prompt. Cargala cuando la tarea lo indique; si ya "
+    "la cargaste en esta conversación, no la vuelvas a cargar: su contenido sigue en el historial.\n\n"
+    "Skills disponibles:\n" + "\n".join(f"- {n}: {d}" for n, d in skills_disponibles().items())
+)
+
+
+@tool("cargar_skill", description=_DESCRIPCION_CARGAR_SKILL)
+def cargar_skill(nombre: Annotated[str, Field(description="Nombre de la skill, ej: 'armar_carrito'.")]) -> str:
+    nombre = nombre.strip().lower().removesuffix(".md")
+    disponibles = skills_disponibles()
+    if nombre not in disponibles:   # error como texto: el agente puede corregirse y reintentar
+        return f"Error: no existe la skill '{nombre}'. Disponibles: {', '.join(disponibles)}."
+    try:
+        _, cuerpo = _separar_frontmatter((SKILLS_DIR / f"{nombre}.md").read_text(encoding="utf-8"))
+    except OSError as e:
+        return f"Error: no se pudo leer la skill '{nombre}' ({e}). Seguí sin ella."
+    return f"Skill: {nombre}\n\n{cuerpo}"   # el nombre va primero: la UI lo muestra
 
 
 # ---------------------------------------------------------------- elegir_supermercados
@@ -262,6 +308,8 @@ def buscar_productos(producto: str, cantidad_por_super: int = 3,
     con algo más específico (tipo, marca, tamaño) o quedarse con lo más barato.
     Revisá la categoría de cada resultado: los que no correspondan (ej: chocolates
     al buscar "leche") registralos con descartar_productos antes de responder.
+    Para interpretar los precios (venta por kilo, unidades, descuentos), cargá la
+    skill leer_resultados si no la cargaste en esta conversación.
 
     Ya aplica las preferencias del usuario (marcas a evitar o preferidas): lo que
     se descartó por eso viene en `descartados_por_preferencias`.
@@ -453,7 +501,10 @@ def optimizar_compra(items: list[ItemCompra], supermercados: list[str] | None = 
     Compara comprar cada producto donde está más barato (compra mixta) contra
     comprar todo en un solo supermercado, considerando envases enteros.
 
-    Antes de usarla, llamá a buscar_productos para cada ítem y pasá acá exactamente
+    Antes de usarla, cargá la skill armar_carrito (si no la cargaste en esta conversación):
+    dice cuándo conviene ir a un supermercado más y cómo presentar el resultado.
+
+    Llamá a buscar_productos para cada ítem y pasá acá exactamente
     el mismo texto de búsqueda. Revisá los nombres elegidos: si alguno no corresponde
     a lo pedido, repetí la búsqueda con un término más específico.
 
@@ -590,7 +641,8 @@ def optimizar_carrito(max_supermercados: int | None = None, runtime: ToolRuntime
 
     Usala cuando el usuario pide optimizar, revisar o abaratar su carrito. Usa los
     precios ya buscados (vuelve a buscar solo si hace falta). Explicá los cambios con
-    el ahorro de cada uno; no cambia el carrito: el usuario decide.
+    el ahorro de cada uno; no cambia el carrito: el usuario decide. Antes, cargá la skill
+    armar_carrito si no la cargaste en esta conversación.
 
     Args:
         max_supermercados: opcional, máximo de supermercados distintos a los que ir.

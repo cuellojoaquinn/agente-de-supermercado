@@ -20,6 +20,9 @@ UNIDADES = {
 REGEX_PRESENTACION = re.compile(
     r"(\d+(?:[.,]\d+)?)\s*(litros?|lts?|l|kilos?|kg|grs?|g|cc|ml)\b", re.IGNORECASE
 )
+REGEX_POR_KILO = re.compile(r"\b(?:x|por)\s*kg\b", re.IGNORECASE)
+
+
 def _normalizar_unidad(u: str | None) -> str:
     return (u or "").strip().lower().rstrip(".")
 
@@ -123,6 +126,9 @@ class VTEXAdapter(SupermercadoAdapter):
 
         # Caso 3: respaldo, extraer del nombre
         m = REGEX_PRESENTACION.search(nombre)
+        # "Vacio de Novillo X Kg." / "Por Kg": sin número = venta por kilo (Price es por kg)
+        if not m and REGEX_POR_KILO.search(nombre):
+            return 1000.0, "g", True
         if m:
             cantidad = float(m.group(1).replace(",", "."))
             contenido, base = _convertir(cantidad, _normalizar_unidad(m.group(2)))
